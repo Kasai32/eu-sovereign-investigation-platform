@@ -148,7 +148,7 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(400).send({ error: `could not parse CSV: ${err instanceof Error ? err.message : String(err)}` });
     }
 
-    const result = await withRequestContext(request.ctx, async (client) => {
+    const setup = await withRequestContext(request.ctx, async (client) => {
       const { rows: sourceRows } = await client.query(`SELECT * FROM ingestion_sources WHERE id = $1`, [sourceId]);
       const { rows: templateRows } = await client.query(`SELECT * FROM column_mapping_templates WHERE id = $1`, [templateId]);
       if (sourceRows.length === 0 || templateRows.length === 0) return { error: "unknown source or template" as const };
@@ -157,7 +157,6 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
 
       const { rows: typeRows } = await client.query(`SELECT * FROM object_types WHERE id = $1`, [template.object_type_id]);
       const objectType = typeRows[0];
-      const schema = objectType.property_schema as PropertySchema;
 
       const runId = randomUUID();
       await client.query(
@@ -166,94 +165,159 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
         [runId, sourceId, templateId, filePart.filename ?? "upload.csv", records.length, request.ctx!.userId],
       );
 
-      let ingested = 0;
-      let quarantined = 0;
-      let autoMerged = 0;
-      let queuedForReview = 0;
-      const mapping = template.mapping as Record<string, string>;
+      return { source, template, objectType, runId };
+    });
 
-      for (let i = 0; i < records.length; i++) {
-        const row = records[i];
-        const properties: Record<string, string> = {};
-        for (const [csvColumn, propertyKey] of Object.entries(mapping)) {
-          if (row[csvColumn] !== undefined && row[csvColumn] !== "") properties[propertyKey] = row[csvColumn];
-        }
+    if ("error" in setup) return reply.code(400).send({ error: setup.error });
+    const { source, template, objectType, runId } = setup;
+    const schema = objectType.property_schema as PropertySchema;
+    const mapping = template.mapping as Record<string, string>;
 
-        const errors = validateProperties(schema, properties);
-        if (errors.length > 0) {
-          await client.query(
-            `INSERT INTO ingestion_run_errors (run_id, row_number, raw_row, error_message) VALUES ($1, $2, $3::jsonb, $4)`,
-            [runId, i + 1, JSON.stringify(row), errors.join("; ")],
-          );
-          quarantined++;
-          continue;
-        }
+    // Each chunk of rows is its own short transaction instead of the whole run being one giant
+    // one. Proven necessary, not theoretical: a real ingestion run against this codebase's
+    // previous single-transaction version took 82s for 20,000 rows over real HTTP, and killing
+    // the server 20s into that run lost every row silently — including the ingestion_runs row
+    // itself, since even its own INSERT was part of the same never-committed transaction. There
+    // was no record a run had even been attempted. Chunking means rows committed in prior
+    // chunks survive a crash, and ingestion_runs' running totals (updated once per chunk, in
+    // the same transaction as the rows they count) always reflect real durable progress.
+    const CHUNK_SIZE = 500;
 
-        const objectId = randomUUID();
-        await client.query(
-          `INSERT INTO objects (id, object_type_id, properties, classification) VALUES ($1, $2, $3::jsonb, $4)`,
-          [objectId, template.object_type_id, JSON.stringify(properties), source.default_classification],
-        );
+    let ingested = 0;
+    let quarantined = 0;
+    let autoMerged = 0;
+    let queuedForReview = 0;
 
-        // One multi-row INSERT instead of one round trip per property — for a row with K
-        // mapped columns this was K sequential awaited queries; a 1,000-row file with 5 mapped
-        // columns issued ~5,000 of these alone. Row ordering/timing relative to the object
-        // insert and the similarity check right below is unchanged, only this inner loop is
-        // collapsed.
-        const propertyKeys = Object.keys(properties);
-        if (propertyKeys.length > 0) {
-          // $1-$4 are shared across every row of this VALUES list (object_id, source name,
-          // classification, raw_source_ref are all constant for this ingested row); only
-          // property_key varies, one placeholder per key starting at $5.
-          const rawSourceRef = `run:${runId}#row:${i + 1}`;
-          const valuesSql = propertyKeys.map((_, k) => `($1, $${k + 5}, $2, 1.0, $3, $4)`).join(", ");
-          await client.query(
-            `INSERT INTO object_property_meta (object_id, property_key, source, confidence, classification, raw_source_ref)
-             VALUES ${valuesSql}`,
-            [objectId, source.name, source.default_classification, rawSourceRef, ...propertyKeys],
-          );
-        }
-        ingested++;
+    try {
+      for (let chunkStart = 0; chunkStart < records.length; chunkStart += CHUNK_SIZE) {
+        const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, records.length);
+        const chunkCounts = await withRequestContext(request.ctx, async (client) => {
+          let chunkIngested = 0;
+          let chunkQuarantined = 0;
+          let chunkAutoMerged = 0;
+          let chunkQueuedForReview = 0;
 
-        const matchValue = properties[template.match_property];
-        if (matchValue) {
-          // Postgres can only use pg_trgm's GIN index via the `%`/`<->` operators, never via a
-          // bare `similarity()` call in ORDER BY — the prior version of this query scored every
-          // row of the object type on every ingested row regardless of index. Setting the
-          // threshold and filtering with `%` lets the index (when match_property is "name", the
-          // one property it currently covers) prune candidates before the exact score is computed.
-          await client.query(`SET LOCAL pg_trgm.similarity_threshold = ${AMBIGUOUS_FLOOR}`);
-          const { rows: matches } = await client.query(
-            `SELECT id, similarity(properties->>$1, $2) AS sim
-             FROM objects
-             WHERE object_type_id = $3 AND id <> $4 AND canonical_of IS NULL
-               AND (properties->>$1) % $2
-             ORDER BY sim DESC LIMIT 1`,
-            [template.match_property, matchValue, template.object_type_id, objectId],
-          );
-          const best = matches[0];
-          if (best && best.sim >= AUTO_MERGE_THRESHOLD) {
-            await client.query(`UPDATE objects SET canonical_of = $1 WHERE id = $2`, [best.id, objectId]);
-            autoMerged++;
-          } else if (best && best.sim >= AMBIGUOUS_FLOOR) {
+          for (let i = chunkStart; i < chunkEnd; i++) {
+            const row = records[i];
+            const properties: Record<string, string> = {};
+            for (const [csvColumn, propertyKey] of Object.entries(mapping)) {
+              if (row[csvColumn] !== undefined && row[csvColumn] !== "") properties[propertyKey] = row[csvColumn];
+            }
+
+            const errors = validateProperties(schema, properties);
+            if (errors.length > 0) {
+              await client.query(
+                `INSERT INTO ingestion_run_errors (run_id, row_number, raw_row, error_message) VALUES ($1, $2, $3::jsonb, $4)`,
+                [runId, i + 1, JSON.stringify(row), errors.join("; ")],
+              );
+              chunkQuarantined++;
+              continue;
+            }
+
+            const objectId = randomUUID();
             await client.query(
-              `INSERT INTO resolution_queue (object_a_id, object_b_id, similarity_score, decision) VALUES ($1, $2, $3, 'pending')`,
-              [best.id, objectId, best.sim],
+              `INSERT INTO objects (id, object_type_id, properties, classification) VALUES ($1, $2, $3::jsonb, $4)`,
+              [objectId, template.object_type_id, JSON.stringify(properties), source.default_classification],
             );
-            queuedForReview++;
+
+            // One multi-row INSERT instead of one round trip per property — for a row with K
+            // mapped columns this was K sequential awaited queries; a 1,000-row file with 5
+            // mapped columns issued ~5,000 of these alone. Row ordering/timing relative to the
+            // object insert and the similarity check right below is unchanged, only this inner
+            // loop is collapsed.
+            const propertyKeys = Object.keys(properties);
+            if (propertyKeys.length > 0) {
+              // $1-$4 are shared across every row of this VALUES list (object_id, source name,
+              // classification, raw_source_ref are all constant for this ingested row); only
+              // property_key varies, one placeholder per key starting at $5.
+              const rawSourceRef = `run:${runId}#row:${i + 1}`;
+              const valuesSql = propertyKeys.map((_, k) => `($1, $${k + 5}, $2, 1.0, $3, $4)`).join(", ");
+              await client.query(
+                `INSERT INTO object_property_meta (object_id, property_key, source, confidence, classification, raw_source_ref)
+                 VALUES ${valuesSql}`,
+                [objectId, source.name, source.default_classification, rawSourceRef, ...propertyKeys],
+              );
+            }
+            chunkIngested++;
+
+            const matchValue = properties[template.match_property];
+            if (matchValue) {
+              // Postgres can only use pg_trgm's GIN index via the `%`/`<->` operators, never via
+              // a bare `similarity()` call in ORDER BY — the prior version of this query scored
+              // every row of the object type on every ingested row regardless of index. Setting
+              // the threshold and filtering with `%` lets the index (when match_property is
+              // "name", the one property it currently covers) prune candidates before the exact
+              // score is computed.
+              await client.query(`SET LOCAL pg_trgm.similarity_threshold = ${AMBIGUOUS_FLOOR}`);
+              const { rows: matches } = await client.query(
+                `SELECT id, similarity(properties->>$1, $2) AS sim
+                 FROM objects
+                 WHERE object_type_id = $3 AND id <> $4 AND canonical_of IS NULL
+                   AND (properties->>$1) % $2
+                 ORDER BY sim DESC LIMIT 1`,
+                [template.match_property, matchValue, template.object_type_id, objectId],
+              );
+              const best = matches[0];
+              if (best && best.sim >= AUTO_MERGE_THRESHOLD) {
+                await client.query(`UPDATE objects SET canonical_of = $1 WHERE id = $2`, [best.id, objectId]);
+                chunkAutoMerged++;
+              } else if (best && best.sim >= AMBIGUOUS_FLOOR) {
+                await client.query(
+                  `INSERT INTO resolution_queue (object_a_id, object_b_id, similarity_score, decision) VALUES ($1, $2, $3, 'pending')`,
+                  [best.id, objectId, best.sim],
+                );
+                chunkQueuedForReview++;
+              }
+            }
           }
-        }
+
+          await client.query(
+            `UPDATE ingestion_runs
+             SET records_ingested = records_ingested + $1, records_quarantined = records_quarantined + $2,
+                 records_auto_merged = records_auto_merged + $3, records_queued_for_review = records_queued_for_review + $4
+             WHERE id = $5`,
+            [chunkIngested, chunkQuarantined, chunkAutoMerged, chunkQueuedForReview, runId],
+          );
+
+          return { chunkIngested, chunkQuarantined, chunkAutoMerged, chunkQueuedForReview };
+        });
+
+        ingested += chunkCounts.chunkIngested;
+        quarantined += chunkCounts.chunkQuarantined;
+        autoMerged += chunkCounts.chunkAutoMerged;
+        queuedForReview += chunkCounts.chunkQueuedForReview;
       }
+    } catch (err) {
+      // A chunk failed outright (an infra-level error — per-row validation failures are already
+      // caught and quarantined above without aborting the chunk). Whatever prior chunks
+      // committed stays durable; mark the run failed instead of leaving it stuck at 'running'
+      // forever with no explanation.
+      await withRequestContext(request.ctx, async (client) => {
+        await client.query(`UPDATE ingestion_runs SET status = 'failed', completed_at = now() WHERE id = $1`, [runId]);
+        await writeAudit(client, {
+          userId: request.ctx!.userId,
+          action: "ingestion.run",
+          resourceType: "ingestion_run",
+          resourceId: runId,
+          purpose: "data ingestion run",
+          details: {
+            filename: filePart.filename,
+            recordsTotal: records.length,
+            ingested,
+            quarantined,
+            autoMerged,
+            queuedForReview,
+            failed: true,
+            error: err instanceof Error ? err.message : String(err),
+          },
+        });
+      }).catch(() => {});
+      return reply.code(500).send({ error: "ingestion run failed partway through; see the ingestion run record for partial progress" });
+    }
 
-      const status = quarantined > 0 ? "completed_with_errors" : "completed";
-      await client.query(
-        `UPDATE ingestion_runs
-         SET status = $1, records_ingested = $2, records_quarantined = $3,
-             records_auto_merged = $4, records_queued_for_review = $5, completed_at = now()
-         WHERE id = $6`,
-        [status, ingested, quarantined, autoMerged, queuedForReview, runId],
-      );
-
+    const status = quarantined > 0 ? "completed_with_errors" : "completed";
+    const finalRun = await withRequestContext(request.ctx, async (client) => {
+      await client.query(`UPDATE ingestion_runs SET status = $1, completed_at = now() WHERE id = $2`, [status, runId]);
       await writeAudit(client, {
         userId: request.ctx!.userId,
         action: "ingestion.run",
@@ -262,13 +326,11 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
         purpose: "data ingestion run",
         details: { filename: filePart.filename, recordsTotal: records.length, ingested, quarantined, autoMerged, queuedForReview },
       });
-
       const { rows: runRows } = await client.query(`SELECT * FROM ingestion_runs WHERE id = $1`, [runId]);
-      return { run: runRows[0] };
+      return runRows[0];
     });
 
-    if ("error" in result) return reply.code(400).send({ error: result.error });
-    reply.code(201).send(result.run);
+    reply.code(201).send(finalRun);
   });
 };
 
