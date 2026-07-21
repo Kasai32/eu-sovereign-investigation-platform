@@ -4,11 +4,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-CONTAINER=platform_postgres
+# Overridable so the same script works against a differently-named/composed stack (e.g. a
+# one-off production-style deploy) without duplicating this logic — default behavior for the
+# everyday dev stack is unchanged.
+CONTAINER="${POSTGRES_CONTAINER:-platform_postgres}"
 DB=platform
 DBUSER=postgres
 
-docker compose up -d postgres
+docker compose ${COMPOSE_FILE:+-f "$COMPOSE_FILE"} up -d postgres
 echo "waiting for postgres..."
 until docker exec "$CONTAINER" pg_isready -U "$DBUSER" -d "$DB" >/dev/null 2>&1; do sleep 1; done
 

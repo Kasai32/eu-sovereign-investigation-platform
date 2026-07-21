@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-CONTAINER=platform_postgres
+CONTAINER="${POSTGRES_CONTAINER:-platform_postgres}"
 DB=platform
 DBUSER=postgres
 

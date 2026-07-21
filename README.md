@@ -321,6 +321,13 @@ short version:
 - **Keycloak client split**: the browser client (`platform-api`) no longer allows the
   password-grant flow the backend test scripts used; a separate `platform-test` client handles
   that now. Closes the item `SECURITY_GAP_ASSESSMENT.md` named as top-priority.
+- **Deployment, interim**: `deploy/` runs the full stack in Docker behind a Cloudflare tunnel —
+  see `deploy/README.md` for exactly what this is (and isn't) a stand-in for while the real EU
+  host (Hetzner) waits on budget. Verified against a real, publicly-reachable instance: signed
+  in as a seed user through the full PKCE flow, ran a complete alert→case→document→close cycle,
+  then fully tore the deployment back down. Surfaced and fixed three real bugs along the way
+  (`DECISIONS.md` #47) — including one where a Compose project-naming mistake briefly recreated
+  the running dev containers, caught immediately and confirmed zero data loss before continuing.
 
 An "AI Project Improvements & Persistent Memory System" proposal (multi-agent decision
 personas, a knowledge-graph world model, confidence/scenario engines, an autonomous
@@ -346,7 +353,8 @@ resumability; the original recursive-CTE shortest path, later replaced by an app
 Check it before re-litigating something already decided or reversing a decision without knowing
 why it was made.
 
-What's left before a design-partner pilot: retention enforcement, DPIA/records-of-processing
-tooling, and a backend-for-frontend to move browser tokens out of `sessionStorage` into an
-httpOnly cookie (`DECISIONS.md` #11) — plus an actual cloud deployment to an EU host, none of
-which exist yet because there's no shared environment to deploy to.
+What's left before a design-partner pilot: DPIA/records-of-processing tooling, a
+backend-for-frontend to move browser tokens out of `sessionStorage` into an httpOnly cookie
+(`DECISIONS.md` #11), backups + a verified restore drill, and the real EU cloud host itself —
+`deploy/` is a budget-interim stand-in (personal machine + Cloudflare tunnel, one-off session
+only), not that. `docs/PLAN.md` phases the rest.

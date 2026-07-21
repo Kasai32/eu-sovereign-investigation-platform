@@ -552,3 +552,69 @@ classification, and 1 quarantined row with a precise "no matching target object"
 crashed a real 3,000-row edge-ingestion run at 1,000 rows and resumed it with the same file:
 completed at exactly 3,000 total edges, confirmed zero duplicates by direct count.
 **Source:** `db/migrations/013_edge_mapping_templates.sql`, `api/src/routes/ingestion.ts`
+
+### #47 — Deployment: a budget-interim Mac + Cloudflare-tunnel demo, not the real EU host (PRD v1.1 B7 part 1)
+
+**Choice:** No funds are currently available for Hetzner Cloud (the recommended EU host), so
+`deploy/run-ephemeral-demo.sh` runs the full stack in Docker on a personal machine, reachable
+via a free Cloudflare quick tunnel, for exactly as long as the script is left running —
+explicitly a one-off session, not a persistent environment. `deploy/README.md` states this
+limitation up front and names the real follow-through (Hetzner + a domain) as a distinct next
+step, not "done." New: `api/Dockerfile`, `web/Dockerfile` (multi-stage, final stage is Caddy
+serving the static build and reverse-proxying `/api/*` and Keycloak's paths from one origin —
+avoids configuring CORS for whatever hostname a fresh tunnel gets assigned), `docker-
+compose.prod.yml` (only Caddy publishes a host port; Postgres/Keycloak/API are internal-network
+-only), fresh random secrets generated into a gitignored `.env.deploy` every run (never the
+checked-in dev placeholders).
+
+**Reason:** B7 in the PRD — the sovereignty claim is the product; an undeployed platform can't
+be piloted. Budget reality meant choosing between not doing this phase at all, or doing an
+honestly-labeled interim version of it. Chose the latter: the acceptance bar (reachable
+instance, full cycle executed against it, secrets outside source control, reproducible steps)
+is met by *something* real, even if it isn't the final infrastructure.
+
+**Three real bugs, found only because this was actually run end to end, not configured and
+assumed correct:**
+
+1. **`api`'s own `start` script had never worked.** `node --experimental-strip-types` strips
+   TypeScript syntax but does not resolve `.js`-suffixed relative imports back to the `.ts`
+   files `tsx` resolves them to — every phase up to now only ever ran `npm run dev` (`tsx
+   watch`), never `npm start`, so this was untested since the day it was written. Fixed:
+   `start` now runs `tsx src/index.ts` directly (moved from a devDependency to a regular one),
+   matching `dev` minus the watcher — not a Docker-specific workaround, a real fix to the
+   script every environment uses.
+2. **Running a second Compose file from the same directory as the dev stack, without an
+   explicit distinct project name, made Compose treat them as one project.** The first attempt
+   at this deploy script silently recreated — and detached from — the running dev
+   `platform_postgres`/`platform_keycloak` containers under the new file's service definitions,
+   because Compose's default project name is directory-derived and matching service names
+   ("postgres", "keycloak") across files with no project isolation are reconciled as the same
+   logical service regardless of `container_name`. The dev Postgres volume survived only
+   because Compose doesn't drop named volumes on a service recreate — nothing else about the
+   first attempt prevented real data loss. Caught immediately (`docker ps` showed the dev
+   containers gone), the dev stack was restored from its still-intact volume, and `objects`
+   count plus `verify_audit_log()` confirmed zero data loss before proceeding. Fixed with an
+   explicit `name: platform-demo` in `docker-compose.prod.yml` — load-bearing, documented
+   in-file with the incident, since removing it silently reintroduces the exact same risk.
+3. **Keycloak generated `http://` login-form action URLs on an `https://` page**, which Chrome
+   correctly refused to submit as insecure mixed content. The tunnel terminates TLS at
+   Cloudflare's edge; every hop after that (cloudflared→Caddy, Caddy→Keycloak) is plain HTTP on
+   the internal network, and Keycloak assumed that local scheme was the real one despite
+   `--proxy-headers=xforwarded` being set. Root cause: Caddy's own default `X-Forwarded-Proto`
+   reflects the scheme *it* received (http, from cloudflared), not what the original browser
+   connection used — the header has to be explicitly overridden to `https`, since that's a
+   correct fact about this specific deployment (every request truly did arrive over HTTPS at
+   the edge), not an assumption. Fixed in `web/Caddyfile`'s `reverse_proxy` blocks to Keycloak.
+
+**Verified**, not just configured: signed in as a real seed user (`sam.supervisor`) through the
+full PKCE flow against the public tunnel URL — Keycloak login page, redirect, token exchange,
+all through the same origin as the web app. Opened the seed case, added a real note, closed the
+case via the API (the web app in this branch has no close-case UI control yet — a separate,
+pre-existing gap, not a deployment issue), confirmed the evidence snapshot froze correctly, and
+generated the case report — the full alert→case→document→close cycle, executed against the
+publicly-reachable deployment, not just locally. Full teardown afterward: tunnel killed, prod
+containers/network removed, `.env.deploy` and the patched realm export deleted; the dev stack's
+`objects` count and audit chain were reverified unchanged throughout.
+**Source:** `deploy/run-ephemeral-demo.sh`, `deploy/teardown.sh`, `deploy/README.md`,
+`docker-compose.prod.yml`, `api/Dockerfile`, `web/Dockerfile`, `web/Caddyfile`, `api/package.json`,
+`db/scripts/migrate.sh`, `db/scripts/seed.sh`

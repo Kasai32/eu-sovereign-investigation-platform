@@ -1,0 +1,84 @@
+# One-off pilot-demo deployment stack (Phase 5 / PRD v1.1 B7), distinct from docker-compose.yml
+# (local dev). Only Caddy (the "web" service) publishes a host port — postgres/keycloak/api are
+# reachable only over the internal compose network, not the host, keeping the exposed surface
+# to exactly what the public tunnel needs. See deploy/README.md for the full story: this runs
+# on a personal machine behind a Cloudflare quick tunnel while budget-constrained, not a real
+# cloud host — deploy/README.md names Hetzner as the intended next step.
+#
+# `name:` below is load-bearing, not decorative: Compose derives a project name from the
+# current directory by default, and docker-compose.yml (dev) is invoked from this same
+# directory. Without an explicit distinct name here, both files resolve to the same project,
+# and Compose reconciles same-named services ("postgres", "keycloak") across files as ONE
+# logical service — silently recreating (and detaching from) the dev containers the first time
+# this file's `up` runs, even though container_name differs below. Learned this the hard way:
+# it took the running dev stack down and swapped in these containers under its own names before
+# the fix was in place; the dev postgres volume survived only because Compose doesn't drop
+# named volumes on a service recreate. Never run this compose file without this line.
+name: platform-demo
+services:
+  postgres:
+    image: postgres:16
+    container_name: platform_postgres_prod
+    environment:
+      POSTGRES_DB: platform
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD}
+    volumes:
+      - pgdata_prod:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d platform"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [internal]
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0
+    container_name: platform_keycloak_prod
+    # --proxy-headers=xforwarded: Caddy (and cloudflared upstream of it) sets X-Forwarded-Proto
+    # correctly, but Keycloak ignores it by default and assumes plain HTTP (the scheme it
+    # actually receives on the internal docker network) — generating http:// login-form action
+    # URLs that Chrome then blocks as insecure-mixed-content from an https:// page. This makes
+    # Keycloak trust those headers instead of guessing from the literal connection it received.
+    command: start-dev --import-realm --hostname=${KC_HOSTNAME} --hostname-strict=false --proxy-headers=xforwarded
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+    volumes:
+      - ./keycloak/realm-export.deploy.json:/opt/keycloak/data/import/realm-export.json:ro
+    networks: [internal]
+
+  api:
+    build: ./api
+    container_name: platform_api_prod
+    environment:
+      PORT: 4000
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: platform
+      PGUSER: app_user
+      PGPASSWORD: ${APP_USER_PASSWORD}
+      KEYCLOAK_ISSUER: ${KEYCLOAK_ISSUER}
+      WEB_ORIGIN: ${TUNNEL_URL}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [internal]
+
+  web:
+    build:
+      context: ./web
+      args:
+        VITE_API_URL: ${VITE_API_URL}
+        VITE_KEYCLOAK_URL: ${VITE_KEYCLOAK_URL}
+    container_name: platform_web_prod
+    ports:
+      - "8000:8000"
+    depends_on: [api, keycloak]
+    networks: [internal]
+
+networks:
+  internal:
+
+volumes:
+  pgdata_prod:
