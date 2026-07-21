@@ -599,3 +599,13 @@ different contrived examples. Reverted; both green again.
 **Source:** `shared/schemas/caseDetail.ts`, `shared/README.md`, `api/src/routes/cases/
 workspace.ts`, `web/src/lib/api/cases.ts`, `web/src/lib/api/client.ts`, `web/src/lib/api/
 types.ts`, `api/tsconfig.json`, `web/tsconfig.json`, `web/vite.config.ts`
+
+**Follow-up, caught by CI rather than locally:** the PR's first CI run failed API typecheck —
+`shared/` is its own npm project (`shared/package.json`), and nothing had ever installed *its*
+dependencies; `zod` only resolved locally because `npm install` had been run there by hand
+during development. `.github/workflows/ci.yml` now installs `shared/`'s dependencies before the
+API/web typecheck steps, the same way it already does for `api/` and `web/` separately.
+Reproduced the exact failure locally first (`rm -rf shared/node_modules` then `npm run
+typecheck` in `api/`) before trusting the fix, rather than assuming the CI-only difference was
+what the log said it was.
+**Source:** `.github/workflows/ci.yml`

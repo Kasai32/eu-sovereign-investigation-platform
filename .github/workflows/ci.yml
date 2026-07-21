@@ -21,6 +21,13 @@ jobs:
         with:
           node-version: "22"
 
+      # shared/ (PRD v1.1 N5's request/response schemas) is its own npm project — api's and
+      # web's tsconfig `include` pull its .ts files into their typecheck, but resolving zod
+      # from inside shared/ needs shared/node_modules to actually exist first.
+      - name: Install shared dependencies
+        working-directory: shared
+        run: npm ci
+
       - name: Start postgres + keycloak
         run: docker compose up -d
 
