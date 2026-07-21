@@ -4,7 +4,8 @@ import { useApiClient, type EdgeMappingTemplate, type MappingTemplate } from "./
 import { useAuth } from "./lib/AuthContext";
 import { ClassificationBadge } from "./components/ClassificationBadge";
 
-// S5: data intake. Deliberate v1 scope per the blueprint — CSV upload only, no live connectors.
+// S5: data intake. Deliberate v1 scope per the blueprint — file upload only (CSV or XLSX), no
+// live connectors.
 export function IntakePage() {
   const api = useApiClient();
   const auth = useAuth();
@@ -17,7 +18,28 @@ export function IntakePage() {
   const edgeTemplatesQuery = useQuery({ queryKey: ["ingestion-edge-templates"], queryFn: () => api.listEdgeTemplates() });
   const objectTypesQuery = useQuery({ queryKey: ["object-types"], queryFn: () => api.listObjectTypes() });
   const relationshipTypesQuery = useQuery({ queryKey: ["relationship-types"], queryFn: () => api.listRelationshipTypes() });
-  const runsQuery = useQuery({ queryKey: ["ingestion-runs"], queryFn: () => api.listIngestionRuns() });
+  // Ingestion now processes in the background (B6) — a run stays 'pending'/'running' after the
+  // upload request already returned, so the runs list polls while any run is still in flight
+  // and stops once everything has reached a terminal status.
+  const runsQuery = useQuery({
+    queryKey: ["ingestion-runs"],
+    queryFn: () => api.listIngestionRuns(),
+    refetchInterval: (query) => {
+      const runs = query.state.data?.runs ?? [];
+      const hasActiveRun = runs.some((r) => r.status === "pending" || r.status === "running");
+      return hasActiveRun ? 2000 : false;
+    },
+  });
+  const retentionRunsQuery = useQuery({ queryKey: ["retention-runs"], queryFn: () => api.listRetentionRuns(), enabled: isAdmin });
+
+  const [retentionPurpose, setRetentionPurpose] = useState("");
+  const runRetention = useMutation({
+    mutationFn: () => api.runRetentionEnforcement(retentionPurpose),
+    onSuccess: () => {
+      setRetentionPurpose("");
+      queryClient.invalidateQueries({ queryKey: ["retention-runs"] });
+    },
+  });
 
   const [newSourceName, setNewSourceName] = useState("");
   const createSource = useMutation({
@@ -130,7 +152,7 @@ export function IntakePage() {
       {/* Upload */}
       {canIngest && (
         <section className="rounded border border-slate-200 bg-white p-4">
-          <h2 className="mb-3 text-sm font-semibold text-slate-700">Upload CSV</h2>
+          <h2 className="mb-3 text-sm font-semibold text-slate-700">Upload CSV or XLSX</h2>
           <div className="mb-2 flex gap-3 text-xs text-slate-600">
             <label className="flex items-center gap-1">
               <input
@@ -207,7 +229,7 @@ export function IntakePage() {
                 </select>
               )}
             </label>
-            <input type="file" accept=".csv" onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="text-sm" />
+            <input type="file" accept=".csv,.xlsx" onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="text-sm" />
             <button
               onClick={() => runIngestion.mutate()}
               disabled={
@@ -226,8 +248,7 @@ export function IntakePage() {
           )}
           {runIngestion.isSuccess && (
             <p className="mt-2 text-sm text-emerald-700">
-              Run complete: {runIngestion.data.records_ingested} ingested, {runIngestion.data.records_auto_merged} auto-merged,{" "}
-              {runIngestion.data.records_queued_for_review} queued for review, {runIngestion.data.records_quarantined} quarantined.
+              Run started — {runIngestion.data.records_total} rows queued for processing. Track progress in the table below.
             </p>
           )}
         </section>
@@ -308,7 +329,11 @@ export function IntakePage() {
             <li key={s.id} className="flex items-center gap-2">
               <span>{s.name}</span>
               <ClassificationBadge classification={s.default_classification} />
-              {s.retention_days && <span className="text-xs text-slate-400">retain {s.retention_days}d</span>}
+              {s.retention_days ? (
+                <span className="text-xs text-slate-400">retain {s.retention_days}d, enforced</span>
+              ) : (
+                <span className="text-xs text-slate-300">no retention policy</span>
+              )}
             </li>
           ))}
         </ul>
@@ -332,6 +357,54 @@ export function IntakePage() {
           </form>
         )}
       </section>
+
+      {/* Retention enforcement (N4): sources with a retention_days policy above have it applied
+          on a schedule, not just stored — this shows that it actually runs, and admins can also
+          trigger a sweep on demand rather than wait for the next scheduled run. */}
+      {isAdmin && (
+        <section className="rounded border border-slate-200 bg-white p-4">
+          <h2 className="mb-3 text-sm font-semibold text-slate-700">Retention enforcement</h2>
+          <ul className="mb-3 space-y-1 text-sm">
+            {retentionRunsQuery.data?.runs.map((r) => (
+              <li key={r.id} className="text-slate-600">
+                {new Date(r.started_at).toLocaleString()} —{" "}
+                {r.completed_at
+                  ? `${r.objects_anonymized} objects, ${r.edges_anonymized} edges anonymized`
+                  : "in progress"}
+              </li>
+            ))}
+            {(retentionRunsQuery.data?.runs.length ?? 0) === 0 && (
+              <li className="text-slate-400">No retention enforcement runs yet.</li>
+            )}
+          </ul>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (retentionPurpose.trim()) runRetention.mutate();
+            }}
+            className="flex gap-2"
+          >
+            <input
+              value={retentionPurpose}
+              onChange={(e) => setRetentionPurpose(e.target.value)}
+              placeholder="Purpose (required to run now)"
+              className="rounded border border-slate-300 px-2 py-1 text-sm"
+            />
+            <button
+              type="submit"
+              disabled={!retentionPurpose.trim() || runRetention.isPending}
+              className="rounded bg-slate-100 px-3 py-1 text-sm hover:bg-slate-200 disabled:opacity-50"
+            >
+              {runRetention.isPending ? "Running…" : "Run now"}
+            </button>
+          </form>
+          {runRetention.isSuccess && (
+            <p className="mt-2 text-sm text-emerald-700">
+              {runRetention.data.objectsAnonymized} objects, {runRetention.data.edgesAnonymized} edges anonymized.
+            </p>
+          )}
+        </section>
+      )}
 
       {/* Templates */}
       <section className="rounded border border-slate-200 bg-white p-4">

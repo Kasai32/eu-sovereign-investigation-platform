@@ -153,6 +153,14 @@ export type AppUser = {
   created_at: string;
 };
 
+export type RetentionRun = {
+  id: string;
+  started_at: string;
+  completed_at: string | null;
+  objects_anonymized: number;
+  edges_anonymized: number;
+};
+
 export type AuditEntry = {
   seq: string;
   user_id: string;
