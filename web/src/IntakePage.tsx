@@ -4,7 +4,8 @@ import { useApiClient, type EdgeMappingTemplate, type MappingTemplate } from "./
 import { useAuth } from "./lib/AuthContext";
 import { ClassificationBadge } from "./components/ClassificationBadge";
 
-// S5: data intake. Deliberate v1 scope per the blueprint — CSV upload only, no live connectors.
+// S5: data intake. Deliberate v1 scope per the blueprint — file upload only (CSV or XLSX), no
+// live connectors.
 export function IntakePage() {
   const api = useApiClient();
   const auth = useAuth();
@@ -141,7 +142,7 @@ export function IntakePage() {
       {/* Upload */}
       {canIngest && (
         <section className="rounded border border-slate-200 bg-white p-4">
-          <h2 className="mb-3 text-sm font-semibold text-slate-700">Upload CSV</h2>
+          <h2 className="mb-3 text-sm font-semibold text-slate-700">Upload CSV or XLSX</h2>
           <div className="mb-2 flex gap-3 text-xs text-slate-600">
             <label className="flex items-center gap-1">
               <input
@@ -218,7 +219,7 @@ export function IntakePage() {
                 </select>
               )}
             </label>
-            <input type="file" accept=".csv" onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="text-sm" />
+            <input type="file" accept=".csv,.xlsx" onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="text-sm" />
             <button
               onClick={() => runIngestion.mutate()}
               disabled={

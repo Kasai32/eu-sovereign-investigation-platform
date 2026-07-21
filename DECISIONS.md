@@ -584,3 +584,42 @@ the connection pool wasn't starved; a second, independent run started and ran to
 while the first was still mid-flight; the web UI reflected both runs' progress live via polling
 with no manual refresh, matching what a browser session would actually observe during a pilot.
 **Source:** `api/src/routes/ingestion.ts`, `web/src/IntakePage.tsx`
+
+### #47 — XLSX ingestion via a shared row-parsing entry point (PRD v1.1 N6)
+
+**Choice:** `parseIngestionFile(buffer, filename)` dispatches on filename extension — `.xlsx`
+goes through a new `parseXlsx()` (built on `exceljs`), anything else keeps going through the
+existing `csv-parse`. Both return the exact same `Record<string, string>[]` shape, so mapping
+templates, validation, entity resolution, quarantine, and resume never branch on file format —
+only the one parsing entry point does. `web/src/IntakePage.tsx`'s file input now accepts
+`.csv,.xlsx`.
+
+**Reason:** Disclosed scope cut in the PRD (N6): the blueprint said CSV/XLSX, only CSV shipped.
+Partners export XLSX as often as CSV; this was a missing capability, not a tuning problem.
+
+**Design note — dependency choice:** the npm-published `xlsx` (SheetJS) package is stuck at
+0.18.5 (SheetJS moved later fixes to their own CDN, off npm) and carries two unfixed advisories
+with no `fixed` version in the npm ecosystem at all (prototype pollution GHSA-4r6h-8v6p-xvw6,
+ReDoS GHSA-5pgg-2g8v-p4x9) — installing it would break this project's clean-`npm audit`
+posture. Used `exceljs` instead (only a long-fixed pre-1.6.0 XSS advisory). `exceljs` itself
+pulled in a moderate `uuid` advisory (GHSA-w5hq-g745-h8pq) transitively; pinned via
+`api/package.json`'s new `overrides: { "uuid": "^11.1.1" }` rather than accepted, since a real
+fix was available without downgrading `exceljs`. `npm audit` is clean again after the override.
+
+**Design note — cell values:** every ontology property is schema'd as `"type": "string"`
+(`db/seed/001_object_types.sql`), and `validateProperties` rejects a non-string value for one.
+A genuinely date- or number-formatted Excel cell comes back from `exceljs` as a JS `Date` or
+`number`, not a string, so `xlsxCellToString()` renders every cell type (including rich text,
+hyperlinks, and formula results) down to a plain string before it ever reaches mapping —
+otherwise a real partner date column would misfire as a validation error instead of ingesting.
+Date-only cells render as `yyyy-mm-dd` (matching this codebase's existing date-string
+convention, e.g. seed `Person.dob`); cells with a time component keep full ISO-8601.
+
+**Verified** against a real `.xlsx` file (not just unit-tested): a 4-row upload with one row
+missing the required `name`-mapped column ingested the 3 valid rows, correctly rendered a
+date-formatted cell as `"1988-05-12"` in the stored object properties, and quarantined the
+invalid row with the same `missing required property "name"` error CSV rows get — same pipeline,
+same failure mode. Resumability was verified the same way #38 verified it for CSV: uploaded a
+3,000-row `.xlsx`, killed the server at 1,500 rows durably committed, restarted, resumed with the
+same file via `/resume`, and confirmed exactly 3,000 total objects with zero duplicates.
+**Source:** `api/src/routes/ingestion.ts`, `api/package.json`, `web/src/IntakePage.tsx`
