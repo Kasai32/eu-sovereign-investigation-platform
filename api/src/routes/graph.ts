@@ -76,49 +76,103 @@ const graphRoutes: FastifyPluginAsync = async (app) => {
     reply.send(result);
   });
 
-  // Server-side shortest path via a bounded recursive CTE — per the build prompt, path-finding
-  // must not be done by pulling the whole graph to the client and walking it in JS. Explores
-  // simple paths (no repeated nodes) up to MAX_PATH_HOPS; fine for this dataset's scale. A
-  // denser production graph would need a proper early-exit bidirectional BFS or a graph DB
-  // (the v2 escape hatch the build prompt already anticipates), not this brute-force expansion.
+  // Shortest path via an app-level breadth-first search, one hop per round trip, tracking only
+  // visited node ids rather than every candidate path. The original version was a single
+  // recursive CTE that tracked a full path array per candidate (per the build prompt's
+  // "path-finding must not be done by pulling the whole graph to the client and walking it in
+  // JS" — the CTE itself was the server-side equivalent of that). A 1M-object/5M-edge load test
+  // found it timed out well before its own advertised MAX_PATH_HOPS: candidate-path count grows
+  // combinatorially with fan-out^hops when every path is tracked separately, and no per-node
+  // fan-out cap fixes that (capping enough to stay fast made the search silently skip most of a
+  // node's real neighbors, so it could report "no path" when one existed). Tracking only visited
+  // nodes instead makes total work linear in edges actually examined.
+  //
+  // MAX_PATH_EDGES_EXAMINED is a real, deliberate tradeoff, not just a safety margin: on the same
+  // load-test graph (median node degree 8, one connected component), unidirectional BFS between
+  // two arbitrary nodes several hops apart can legitimately need to touch a large fraction of the
+  // whole graph on its last hop before the frontier reaches the target — small-world graphs grow
+  // near-exponentially per hop, so the hop that finds a distant target is often as expensive as
+  // every previous hop combined (observed: one real 4-hop pair required 778k edges examined and
+  // ~390k of the graph's 1M nodes visited to connect). Chasing full completeness would mean no
+  // fixed budget keeps this under the 3s target for every pair. 150k stays comfortably under 3s
+  // in every case measured (worst observed: ~1s), at the cost of occasionally reporting "not
+  // found within budget" (budgetExceeded: true) for pairs that are genuinely connected but distant
+  // — an honest "didn't finish searching" rather than a wrong "no path exists" or a hang. A
+  // bidirectional BFS (search from both ends, meet in the middle) would close this gap for real —
+  // that's what the original comment's "early-exit bidirectional BFS" meant — but is a larger
+  // rewrite than this pass; worth doing before path-finding is relied on for genuinely distant
+  // pairs rather than the "does X connect to Y within a few hops" queries this mainly serves.
   const MAX_PATH_HOPS = 6;
+  const MAX_PATH_EDGES_EXAMINED = 150_000;
 
   app.get("/graph/path", async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
     const q = request.query as { from?: string; to?: string; purpose?: string };
     if (!q.from || !q.to) return reply.code(400).send({ error: "from and to are required" });
     const purpose = q.purpose ?? "path-finding during investigation";
+    const from = q.from;
+    const to = q.to;
 
     const result = await withRequestContext(request.ctx, async (client) => {
-      const { rows } = await client.query(
-        `WITH RECURSIVE search(node_id, path, depth) AS (
-           SELECT $1::uuid, ARRAY[$1::uuid], 0
-           UNION ALL
-           SELECT
-             CASE WHEN e.source_object_id = s.node_id THEN e.target_object_id ELSE e.source_object_id END,
-             s.path || (CASE WHEN e.source_object_id = s.node_id THEN e.target_object_id ELSE e.source_object_id END),
-             s.depth + 1
-           FROM edges e
-           JOIN search s ON e.source_object_id = s.node_id OR e.target_object_id = s.node_id
-           WHERE s.depth < $3
-             AND NOT (CASE WHEN e.source_object_id = s.node_id THEN e.target_object_id ELSE e.source_object_id END = ANY(s.path))
-         )
-         SELECT path, depth FROM search WHERE node_id = $2::uuid ORDER BY depth ASC LIMIT 1`,
-        [q.from, q.to, MAX_PATH_HOPS],
-      );
+      const parent = new Map<string, string>();
+      const visited = new Set<string>([from]);
+      let frontier = [from];
+      let found = from === to;
+      let edgesExamined = 0;
+      let hopsTaken = 0;
+
+      while (!found && frontier.length > 0 && hopsTaken < MAX_PATH_HOPS && edgesExamined < MAX_PATH_EDGES_EXAMINED) {
+        hopsTaken++;
+        const frontierSet = new Set(frontier);
+        const remainingBudget = MAX_PATH_EDGES_EXAMINED - edgesExamined;
+        const { rows: edgeRows } = await client.query<{ source_object_id: string; target_object_id: string }>(
+          `SELECT source_object_id, target_object_id FROM edges
+           WHERE source_object_id = ANY($1::uuid[]) OR target_object_id = ANY($1::uuid[])
+           LIMIT $2`,
+          [frontier, remainingBudget],
+        );
+        edgesExamined += edgeRows.length;
+
+        const nextFrontier: string[] = [];
+        for (const row of edgeRows) {
+          const inFrontier = frontierSet.has(row.source_object_id) ? row.source_object_id : row.target_object_id;
+          const neighbor = inFrontier === row.source_object_id ? row.target_object_id : row.source_object_id;
+          if (visited.has(neighbor)) continue;
+          visited.add(neighbor);
+          parent.set(neighbor, inFrontier);
+          nextFrontier.push(neighbor);
+          if (neighbor === to) {
+            found = true;
+            break;
+          }
+        }
+        frontier = nextFrontier;
+      }
+
+      // Budget exhausted before either finding the target or exploring every reachable node
+      // within MAX_PATH_HOPS: some real neighbors were never queried, so a "not found" here
+      // means "not found within the search budget," not "provably no path exists."
+      const budgetExceeded = !found && edgesExamined >= MAX_PATH_EDGES_EXAMINED;
 
       await writeAudit(client, {
         userId: request.ctx!.userId,
         action: "graph.path",
         resourceType: "object",
-        resourceId: q.from!,
+        resourceId: from,
         purpose,
-        details: { to: q.to, found: rows.length > 0 },
+        details: { to, found, hops: hopsTaken, edgesExamined, budgetExceeded },
       });
 
-      if (rows.length === 0) return { found: false, nodes: [], edges: [] };
+      if (!found) return { found: false as const, nodes: [], edges: [], budgetExceeded };
 
-      const pathIds: string[] = rows[0].path;
+      const pathIds: string[] = [to];
+      for (let cur = to; cur !== from; ) {
+        const p = parent.get(cur)!;
+        pathIds.push(p);
+        cur = p;
+      }
+      pathIds.reverse();
+
       const { rows: nodes } = await client.query(
         `SELECT o.id, ot.name AS object_type, o.properties, o.classification
          FROM objects o JOIN object_types ot ON ot.id = o.object_type_id
@@ -143,7 +197,7 @@ const graphRoutes: FastifyPluginAsync = async (app) => {
         if (pairEdges[0]) edges.push(pairEdges[0]);
       }
 
-      return { found: true, path: pathIds, hops: rows[0].depth, nodes, edges };
+      return { found: true as const, path: pathIds, hops: pathIds.length - 1, nodes, edges };
     });
 
     reply.send(result);

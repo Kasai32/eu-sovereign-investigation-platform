@@ -96,7 +96,7 @@ const mockApi = {
   unpinEntity: vi.fn(async () => ({ ok: true as const })),
   setCaseStatus: vi.fn(async () => ({})),
   expandGraph: vi.fn(async () => ({ nodes: [], edges: [], truncated: false, requestedHops: 1 })),
-  findPath: vi.fn(async () => ({ found: false as const, nodes: [] as const, edges: [] as const })),
+  findPath: vi.fn(async () => ({ found: false as const, nodes: [] as const, edges: [] as const, budgetExceeded: false })),
 };
 
 vi.mock("./lib/api", async (importOriginal) => {

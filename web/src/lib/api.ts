@@ -96,7 +96,7 @@ export type GraphEdge = {
 
 export type ExpandResult = { nodes: GraphNode[]; edges: GraphEdge[]; truncated: boolean; requestedHops: number };
 export type PathResult =
-  | { found: false; nodes: []; edges: [] }
+  | { found: false; nodes: []; edges: []; budgetExceeded: boolean }
   | { found: true; path: string[]; hops: number; nodes: GraphNode[]; edges: GraphEdge[] };
 
 export type ObjectType = {
