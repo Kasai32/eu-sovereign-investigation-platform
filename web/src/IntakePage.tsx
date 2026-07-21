@@ -4,7 +4,8 @@ import { useApiClient, type EdgeMappingTemplate, type MappingTemplate } from "./
 import { useAuth } from "./lib/AuthContext";
 import { ClassificationBadge } from "./components/ClassificationBadge";
 
-// S5: data intake. Deliberate v1 scope per the blueprint — CSV upload only, no live connectors.
+// S5: data intake. Deliberate v1 scope per the blueprint — file upload only (CSV or XLSX), no
+// live connectors.
 export function IntakePage() {
   const api = useApiClient();
   const auth = useAuth();
@@ -17,7 +18,18 @@ export function IntakePage() {
   const edgeTemplatesQuery = useQuery({ queryKey: ["ingestion-edge-templates"], queryFn: () => api.listEdgeTemplates() });
   const objectTypesQuery = useQuery({ queryKey: ["object-types"], queryFn: () => api.listObjectTypes() });
   const relationshipTypesQuery = useQuery({ queryKey: ["relationship-types"], queryFn: () => api.listRelationshipTypes() });
-  const runsQuery = useQuery({ queryKey: ["ingestion-runs"], queryFn: () => api.listIngestionRuns() });
+  // Ingestion now processes in the background (B6) — a run stays 'pending'/'running' after the
+  // upload request already returned, so the runs list polls while any run is still in flight
+  // and stops once everything has reached a terminal status.
+  const runsQuery = useQuery({
+    queryKey: ["ingestion-runs"],
+    queryFn: () => api.listIngestionRuns(),
+    refetchInterval: (query) => {
+      const runs = query.state.data?.runs ?? [];
+      const hasActiveRun = runs.some((r) => r.status === "pending" || r.status === "running");
+      return hasActiveRun ? 2000 : false;
+    },
+  });
   const retentionRunsQuery = useQuery({ queryKey: ["retention-runs"], queryFn: () => api.listRetentionRuns(), enabled: isAdmin });
 
   const [retentionPurpose, setRetentionPurpose] = useState("");
@@ -140,7 +152,7 @@ export function IntakePage() {
       {/* Upload */}
       {canIngest && (
         <section className="rounded border border-slate-200 bg-white p-4">
-          <h2 className="mb-3 text-sm font-semibold text-slate-700">Upload CSV</h2>
+          <h2 className="mb-3 text-sm font-semibold text-slate-700">Upload CSV or XLSX</h2>
           <div className="mb-2 flex gap-3 text-xs text-slate-600">
             <label className="flex items-center gap-1">
               <input
@@ -217,7 +229,7 @@ export function IntakePage() {
                 </select>
               )}
             </label>
-            <input type="file" accept=".csv" onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="text-sm" />
+            <input type="file" accept=".csv,.xlsx" onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="text-sm" />
             <button
               onClick={() => runIngestion.mutate()}
               disabled={
@@ -236,8 +248,7 @@ export function IntakePage() {
           )}
           {runIngestion.isSuccess && (
             <p className="mt-2 text-sm text-emerald-700">
-              Run complete: {runIngestion.data.records_ingested} ingested, {runIngestion.data.records_auto_merged} auto-merged,{" "}
-              {runIngestion.data.records_queued_for_review} queued for review, {runIngestion.data.records_quarantined} quarantined.
+              Run started — {runIngestion.data.records_total} rows queued for processing. Track progress in the table below.
             </p>
           )}
         </section>

@@ -321,6 +321,18 @@ short version:
 - **Keycloak client split**: the browser client (`platform-api`) no longer allows the
   password-grant flow the backend test scripts used; a separate `platform-test` client handles
   that now. Closes the item `SECURITY_GAP_ASSESSMENT.md` named as top-priority.
+- **Ingestion processing moved off the request/response cycle**: chunking (above) made a large
+  run crash-safe, but a real 20,000-row upload still held one HTTP request open for its full
+  82s. `POST /ingestion/runs`/`resume` now return as soon as the run is created, processing
+  continues in the background, and the intake UI polls for status. Verified against a real
+  20k-row run: the request returned in ~70ms, and concurrent requests stayed fast (2-20ms)
+  throughout processing instead of contending for a starved pool.
+- **XLSX ingestion**: the blueprint's disclosed CSV/XLSX scope cut is closed — a shared
+  `parseIngestionFile()` entry point turns either format into the same row shape, so mapping,
+  validation, entity resolution, quarantine, and resume never branch on file format. Verified
+  against a real `.xlsx` file, including crashing a 3,000-row run mid-flight and resuming it
+  with zero duplicates, same as CSV. Uses `exceljs`, not the npm-published `xlsx` package —
+  the latter carries two unfixed advisories with no fix in the npm ecosystem at all.
 - **Retention enforcement**: `retention_days` was stored per source since Phase 5 but never
   applied. A scheduled sweep now anonymizes (never deletes — `app_user` has no `DELETE` grant
   on ontology tables at all, by original design) objects/edges whose source's window has
@@ -356,5 +368,5 @@ What's left before a design-partner pilot: DPIA/records-of-processing tooling, a
 backend-for-frontend to move browser tokens out of `sessionStorage` into an httpOnly cookie
 (`DECISIONS.md` #11) — plus an actual cloud deployment to an EU host, none of which exist yet
 because there's no shared environment to deploy to. `docs/PLAN.md` phases the remaining PRD
-v1.1 items (async ingestion, XLSX ingestion, API type safety, deployment, backup/restore —
-retention enforcement is done); the BFF/token item isn't yet in that plan.
+v1.1 items (API type safety, deployment, backup/restore — async ingestion, XLSX ingestion, and
+retention enforcement are done); the BFF/token item isn't yet in that plan.
