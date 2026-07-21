@@ -97,7 +97,12 @@ const casesLifecycleRoutes: FastifyPluginAsync = async (app) => {
   // had actually consumed it. Redaction is automatic, not a separate step: this query runs
   // through the same RLS-scoped connection as every other read, so an entity above the
   // exporting user's clearance simply never appears in the result.
-  app.get("/cases/:id/report", async (request, reply) => {
+  app.get(
+    "/cases/:id/report",
+    // Tighter than the 300/min global default: an export runs several sequential queries
+    // (entities, per-entity provenance, notes, activity) per request — see DECISIONS.md #21.
+    { config: { rateLimit: { max: 20, timeWindow: "1 minute" } } },
+    async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
     const { id } = request.params as { id: string };
     const { purpose } = request.query as { purpose?: string };

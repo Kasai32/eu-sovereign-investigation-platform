@@ -225,8 +225,7 @@ genuinely can't.
 **Choice:** 300 req/min, one bucket, applied globally (`/health` exempted).
 **Reason:** No real traffic exists yet to tune per-route limits against; a global default is
 better than no limit.
-**Status:** open gap — ingestion and report-export are more expensive per-request than search
-and would benefit from tighter limits once real usage patterns exist.
+**Status:** **Closed by #41.**
 **Source:** `PHASE6_REVIEW.md`
 
 ### #22 — Verify security-relevant behavior over the same connection path the app actually uses
@@ -245,15 +244,15 @@ separate test/CI client during the hardening pass.
 **Reason:** Splitting would break `test-rls-http.sh`/`test-audit-chain.sh` without also standing
 up a second client and updating those scripts — felt like the wrong trade to make silently
 inside a hardening pass.
-**Status:** named explicitly as the top-priority remaining item in `SECURITY_GAP_ASSESSMENT.md`
-instead of fixed. Still open.
+**Status:** **Closed by #42.** Was named explicitly as the top-priority remaining item in
+`SECURITY_GAP_ASSESSMENT.md`.
 **Source:** `PHASE6_REVIEW.md`
 
 ### #24 — No CI pipeline stood up
 **Choice:** All regression tests (`test-rls.sh`, `test-audit-chain.sh`, `test-rls-http.sh`,
 Vitest, both typechecks) remain manual/local-only.
 **Reason:** No shared repo/CI environment existed yet to build a pipeline in.
-**Status:** open gap, named as mechanical (not risky) to close once one exists.
+**Status:** **Closed by #43.**
 **Source:** `PHASE6_REVIEW.md`
 
 ---
@@ -456,3 +455,47 @@ path for this one.
 practices independent of the AI-agent framing around them — this file is that piece, deliberately
 kept separate from the rest of the proposal.
 **Source:** this session
+
+---
+
+## This session — closing open items from #10/#11/#16/#17/#21/#23/#24/#36
+
+### #41 — Per-route rate limiting on the two expensive endpoints, closing #21
+**Choice:** `POST /ingestion/runs`, `POST /ingestion/runs/:id/resume` (10/min), and
+`GET /cases/:id/report` (20/min) now override the 300/min global default via Fastify's
+per-route `config.rateLimit`.
+**Reason:** Both hold a pooled connection through multiple sequential/chunked queries per
+request, unlike a cheap `/search` call — exactly the routes #21 named as needing tighter limits
+once a real prioritization pass happened.
+**Verified:** live response headers confirmed `x-ratelimit-limit: 300` on `/objects`,
+`20` on the report endpoint, `10` on both ingestion endpoints.
+**Source:** `api/src/routes/ingestion.ts`, `api/src/routes/cases/lifecycle.ts`
+
+### #42 — Split the Keycloak client into a browser-only PKCE client and a test-only ROPC client, closing #10/#23
+**Choice:** `platform-api` (the real browser client) now has `directAccessGrantsEnabled: false` —
+PKCE/Authorization Code only. A new `platform-test` client (`standardFlowEnabled: false`,
+`directAccessGrantsEnabled: true`) is used exclusively by `api/scripts/test-rls-http.sh`.
+**Reason:** Named as the top-priority remaining item in `SECURITY_GAP_ASSESSMENT.md` since
+Phase 6 — a public client that both a real browser and a bare backend script can obtain tokens
+from is a wider credential-acquisition surface than the browser flow alone needs.
+**Verified live**, not just by editing the realm export: `grant_type=password` against
+`platform-api` now returns `unauthorized_client` / "Client not allowed for direct access
+grants"; the same request against `platform-test` succeeds; a full real PKCE browser login
+(Sam Supervisor, real Keycloak redirect, real callback) against `platform-api` still works
+end to end with zero console errors; `test-rls-http.sh` re-run against the split clients still
+passes every check.
+**Source:** `keycloak/realm-export.json`, `api/scripts/test-rls-http.sh`
+
+### #43 — GitHub Actions CI pipeline, closing #24
+**Choice:** `.github/workflows/ci.yml` runs the exact same sequence a developer runs locally per
+`README.md` — `docker compose up`, `migrate.sh`, `seed.sh`, both typechecks, Vitest,
+`test-rls.sh`, `test-audit-chain.sh`, start the API server, `test-rls-http.sh` — rather than a
+parallel CI-specific setup that could drift from what's actually documented.
+**Reason:** Named as "mechanical, not risky" since the scripts already existed and already
+worked; the only reason it wasn't done earlier was no shared repo/CI environment existed to
+build it in.
+**Verified:** ran the entire sequence locally against a genuinely fresh environment first
+(`docker compose down -v`, full recreate) rather than trusting the YAML would work — every step
+passed, including a fresh 12-migration apply that the existing local dev DB (already migrated)
+couldn't have exercised.
+**Source:** `.github/workflows/ci.yml`

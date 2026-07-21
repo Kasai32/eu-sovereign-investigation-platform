@@ -19,8 +19,11 @@ pass() {
 }
 
 token_for() {
+  # platform-test is a dedicated ROPC-only client (see DECISIONS.md #10/#23) — platform-api
+  # (the real browser client) no longer allows direct access grants, matching the split this
+  # was named as needing since Phase 2.
   curl -s -X POST "$KEYCLOAK_URL/realms/platform/protocol/openid-connect/token" \
-    -d "grant_type=password" -d "client_id=platform-api" \
+    -d "grant_type=password" -d "client_id=platform-test" \
     -d "username=$1" -d "password=devpassword123" \
     | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])"
 }

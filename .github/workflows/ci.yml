@@ -1,0 +1,96 @@
+name: CI
+
+# Wires up the test scripts that already existed but only ever ran manually/locally (see
+# PHASE6_REVIEW.md and DECISIONS.md #24 — named as "mechanical, not risky" to close once a
+# shared repo/CI environment existed). Deliberately mirrors the README's own local-dev setup
+# steps (docker compose up, migrate.sh, seed.sh, npm run dev) rather than a parallel
+# CI-specific config, so this can't silently drift from what a developer actually runs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Start postgres + keycloak
+        run: docker compose up -d
+
+      - name: Wait for postgres
+        run: |
+          until docker exec platform_postgres pg_isready -U postgres -d platform >/dev/null 2>&1; do
+            sleep 2
+          done
+
+      - name: Wait for keycloak
+        timeout-minutes: 3
+        run: |
+          until curl -sf http://localhost:8080/realms/master >/dev/null 2>&1; do
+            sleep 2
+          done
+
+      - name: Apply migrations
+        run: bash db/scripts/migrate.sh
+
+      - name: Seed synthetic data
+        run: bash db/scripts/seed.sh
+
+      - name: Install API dependencies
+        working-directory: api
+        run: npm ci
+
+      - name: API typecheck
+        working-directory: api
+        run: npm run typecheck
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Web typecheck
+        working-directory: web
+        run: npm run typecheck
+
+      - name: Web tests
+        working-directory: web
+        run: npm test
+
+      # RLS and audit-chain tests only need Postgres, run before the API server starts.
+      - name: RLS regression test
+        run: bash db/scripts/test-rls.sh
+
+      - name: Audit hash-chain regression test
+        run: bash db/scripts/test-audit-chain.sh
+
+      - name: Start API server
+        working-directory: api
+        run: |
+          PORT=4000 nohup npm run dev > /tmp/api.log 2>&1 &
+          disown
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:4000/health >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "API server did not become ready in time" >&2
+          cat /tmp/api.log
+          exit 1
+
+      - name: HTTP-level RLS test (real Keycloak tokens through the real API)
+        working-directory: api
+        run: bash scripts/test-rls-http.sh
+
+      - name: Dump API server log
+        if: failure()
+        run: cat /tmp/api.log || true
+
+      - name: Dump docker compose logs
+        if: failure()
+        run: docker compose logs

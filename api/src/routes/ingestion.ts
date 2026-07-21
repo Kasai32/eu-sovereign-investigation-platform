@@ -310,7 +310,13 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
   // a new object with full provenance -> fuzzy-match against existing objects of the same type
   // for entity resolution. One bad row quarantines that row and continues; it never aborts the
   // whole batch.
-  app.post("/ingestion/runs", async (request, reply) => {
+  app.post(
+    "/ingestion/runs",
+    // Tighter than the 300/min global default (api/src/index.ts): a single run can hold a
+    // pooled connection through many chunked transactions in a row, unlike a cheap /search
+    // call — see DECISIONS.md #21.
+    { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
+    async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
     if (!PRIVILEGED_ROLES.includes(request.ctx.actorRole)) {
       return reply.code(403).send({ error: "ingestion is restricted to supervisor/compliance/admin roles" });
@@ -379,7 +385,10 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
   // file can't silently process the wrong rows for the un-ingested remainder. Resumes from
   // records_ingested + records_quarantined, which is always exactly how many rows have been
   // durably committed regardless of how many prior attempts it took to get there.
-  app.post("/ingestion/runs/:id/resume", async (request, reply) => {
+  app.post(
+    "/ingestion/runs/:id/resume",
+    { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
+    async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
     if (!PRIVILEGED_ROLES.includes(request.ctx.actorRole)) {
       return reply.code(403).send({ error: "ingestion is restricted to supervisor/compliance/admin roles" });
