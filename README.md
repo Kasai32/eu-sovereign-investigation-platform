@@ -230,11 +230,33 @@ web/src/
 Same as before. Sign in as `adam.admin` for the Users and Audit screens (nav links only appear
 for compliance/admin roles). Export a report from any case workspace's "Export report" link.
 
+## Phase 6: hardening
+
+Rate limiting (`@fastify/rate-limit`, 300 req/min global default, `/health` exempted), security
+headers (`@fastify/helmet`), a request body-size cap set safely above the multipart upload
+limit, and a CORS origin allowlist that reads a comma-separated list from config instead of one
+hardcoded default. Also: Postgres/Keycloak admin passwords and `app_user`'s password are now
+configurable via `.env` (copy `.env.example`) instead of hardcoded-only — verified with an
+actual password rotation over a real TCP connection (the same code path the API's `pg` driver
+uses; `docker exec psql` would have given a false pass, since the Postgres image trusts local
+Unix-socket connections regardless of password — see `PHASE6_REVIEW.md`).
+
+`npm audit` is clean on both `api/` and `web/`. The full regression suite (`test-rls.sh`,
+`test-audit-chain.sh`, `test-rls-http.sh`, the Vitest suite, both typechecks) was re-run after
+every change in this phase.
+
+`SECURITY_GAP_ASSESSMENT.md` is a code-level pass against ISO/IEC 27001:2022 Annex A — not a
+certification audit, but an honest baseline naming what's covered, what's partial, and what's a
+real gap (retention enforcement, CI automation, DPIA tooling, monitoring/alerting, splitting the
+Keycloak client's browser and test-script grant types), each with a rough priority.
+
 ## Status
 
-Phases 0–5 (schema/RLS/audit chain, API + Keycloak auth, S1/S3/S4 frontend, S2 case workspace,
-S5/S6 intake + entity resolution, S7 admin/audit/export) are done and verified — see
-`PHASE0_REVIEW.md` through `PHASE5_REVIEW.md`. This closes out the blueprint's originally-scoped
-v1 screen list. What's next is hardening (ISO 27001 gap assessment, real secrets management,
-rate limiting, per-environment CORS config) before a design-partner pilot, per the strategy
-document's own phasing — not new product surface.
+Phases 0–6 (schema/RLS/audit chain, API + Keycloak auth, S1/S3/S4 frontend, S2 case workspace,
+S5/S6 intake + entity resolution, S7 admin/audit/export, hardening) are done and verified — see
+`PHASE0_REVIEW.md` through `PHASE6_REVIEW.md` and `SECURITY_GAP_ASSESSMENT.md`. This closes out
+the blueprint's originally-scoped v1 screen list plus the strategy document's pre-pilot
+hardening checklist. What's left before a design-partner pilot is the items named in the gap
+assessment's priority list — CI automation, retention enforcement, DPIA/records-of-processing
+tooling — plus an actual cloud deployment to an EU host, none of which exist yet because there's
+no shared environment to deploy to.

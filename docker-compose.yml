@@ -5,7 +5,11 @@ services:
     environment:
       POSTGRES_DB: platform
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres_local_dev_only
+      # Bootstrap/migration-role password only — the app itself never connects with this
+      # role (see db/migrations/005_roles_and_rls.sql). Falls back to a clearly-labeled
+      # placeholder for local dev; copy .env.example to .env and set a real value for
+      # any shared or production environment.
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-postgres_local_dev_only}
     ports:
       - "5432:5432"
     volumes:
@@ -22,7 +26,7 @@ services:
     command: start-dev --import-realm
     environment:
       KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: admin_local_dev_only
+      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin_local_dev_only}
     ports:
       - "8080:8080"
     volumes:
