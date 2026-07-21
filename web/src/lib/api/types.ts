@@ -42,33 +42,18 @@ export type CaseSummary = {
   entity_count: number;
 };
 
-export type CaseEntity = {
-  object_id: string;
-  object_type: string;
-  properties: Record<string, unknown>;
-  classification: string;
-  pinned_by: string;
-  pinned_at: string;
-};
-
-export type CaseNote = { id: string; body: string; author_id: string; author_name: string; created_at: string };
-export type CaseActivity = {
-  id: string;
-  action: string;
-  details: Record<string, unknown>;
-  actor_id: string;
-  actor_name: string;
-  occurred_at: string;
-};
-export type CaseMember = { user_id: string; display_name: string; role: string };
-
-export type CaseDetail = {
-  case: CaseSummary & { evidence_snapshot: unknown; closed_at: string | null };
-  entities: CaseEntity[];
-  notes: CaseNote[];
-  activity: CaseActivity[];
-  members: CaseMember[];
-};
+// GET /cases/:id's shapes are the single case migrated to a shared, validated schema so far
+// (PRD v1.1 N5) — re-exported under their pre-existing names so every file that already
+// imports CaseEntity/CaseNote/CaseActivity/CaseMember/CaseDetail from here is unaffected. The
+// authoritative definition lives in shared/schemas/caseDetail.ts, not here; see shared/README.md
+// before hand-editing any of these.
+export type {
+  CaseDetailEntity as CaseEntity,
+  CaseDetailNote as CaseNote,
+  CaseDetailActivity as CaseActivity,
+  CaseDetailMember as CaseMember,
+  CaseDetailResponse as CaseDetail,
+} from "../../../../shared/schemas/caseDetail";
 
 export type GraphNode = { id: string; object_type: string; properties: Record<string, unknown>; classification: string };
 export type GraphEdge = {
@@ -166,6 +151,14 @@ export type AppUser = {
   clearance: "PUBLIC" | "INTERNAL" | "SENSITIVE" | "RESTRICTED";
   is_active: boolean;
   created_at: string;
+};
+
+export type RetentionRun = {
+  id: string;
+  started_at: string;
+  completed_at: string | null;
+  objects_anonymized: number;
+  edges_anonymized: number;
 };
 
 export type AuditEntry = {

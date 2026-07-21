@@ -553,7 +553,181 @@ crashed a real 3,000-row edge-ingestion run at 1,000 rows and resumed it with th
 completed at exactly 3,000 total edges, confirmed zero duplicates by direct count.
 **Source:** `db/migrations/013_edge_mapping_templates.sql`, `api/src/routes/ingestion.ts`
 
-### #47 — Deployment: a budget-interim Mac + Cloudflare-tunnel demo, not the real EU host (PRD v1.1 B7 part 1)
+### #46 — Ingestion processing moved off the request/response cycle (PRD v1.1 B6)
+
+**Choice:** `POST /ingestion/runs` (both create paths) and `POST /ingestion/runs/:id/resume` now
+return `202` with the freshly created/resumed run (status `running`, counters at their starting
+values) as soon as the run row exists, instead of awaiting `runIngestionChunks`/
+`runEdgeIngestionChunks` to completion first. The actual chunk processing — unchanged from
+#37/#38 — runs after the response is sent; its outcome (including marking the run `failed`) is
+handled entirely inside that detached execution, since nothing is listening on an HTTP response
+by the time it finishes. `web/src/IntakePage.tsx`'s runs list now polls every 2s while any run is
+`pending`/`running`, since the upload response itself no longer carries final counts.
+
+**Reason:** #37 made a large run resumable and crash-safe, but never addressed the PRD's actual
+complaint: a real 20,000-row run still held one HTTP request (and, transitively, the client's
+connection) open for however long the whole file took — 82s in #37's own measurement, worse for
+a partner-sized 50k-row file. Chunking already released the *processing* connection between
+chunks; the request/response lifecycle was the one piece still coupled to total run duration.
+
+**Design note:** the per-run advisory lock (#38) had to be split into an explicit
+acquire/release (`tryAcquireRunLock`) rather than the previous single `withRunLock(id, fn)`
+helper that acquired, ran, and released as one unit. A real concurrent second attempt at the same
+run must still get an immediate `409` — verified behavior worth keeping — which requires
+learning synchronously whether the lock was won, before deciding to hand off the rest to the
+background.
+
+**Verified** against a real 20,000-row upload over HTTP: the request returned in ~70ms (`202`,
+`records_ingested: 0`) instead of blocking; concurrent `GET /ingestion/runs` and `GET /objects`
+calls issued while that run was actively processing completed in 2-20ms throughout, confirming
+the connection pool wasn't starved; a second, independent run started and ran to `completed`
+while the first was still mid-flight; the web UI reflected both runs' progress live via polling
+with no manual refresh, matching what a browser session would actually observe during a pilot.
+**Source:** `api/src/routes/ingestion.ts`, `web/src/IntakePage.tsx`
+
+### #47 — XLSX ingestion via a shared row-parsing entry point (PRD v1.1 N6)
+
+**Choice:** `parseIngestionFile(buffer, filename)` dispatches on filename extension — `.xlsx`
+goes through a new `parseXlsx()` (built on `exceljs`), anything else keeps going through the
+existing `csv-parse`. Both return the exact same `Record<string, string>[]` shape, so mapping
+templates, validation, entity resolution, quarantine, and resume never branch on file format —
+only the one parsing entry point does. `web/src/IntakePage.tsx`'s file input now accepts
+`.csv,.xlsx`.
+
+**Reason:** Disclosed scope cut in the PRD (N6): the blueprint said CSV/XLSX, only CSV shipped.
+Partners export XLSX as often as CSV; this was a missing capability, not a tuning problem.
+
+**Design note — dependency choice:** the npm-published `xlsx` (SheetJS) package is stuck at
+0.18.5 (SheetJS moved later fixes to their own CDN, off npm) and carries two unfixed advisories
+with no `fixed` version in the npm ecosystem at all (prototype pollution GHSA-4r6h-8v6p-xvw6,
+ReDoS GHSA-5pgg-2g8v-p4x9) — installing it would break this project's clean-`npm audit`
+posture. Used `exceljs` instead (only a long-fixed pre-1.6.0 XSS advisory). `exceljs` itself
+pulled in a moderate `uuid` advisory (GHSA-w5hq-g745-h8pq) transitively; pinned via
+`api/package.json`'s new `overrides: { "uuid": "^11.1.1" }` rather than accepted, since a real
+fix was available without downgrading `exceljs`. `npm audit` is clean again after the override.
+
+**Design note — cell values:** every ontology property is schema'd as `"type": "string"`
+(`db/seed/001_object_types.sql`), and `validateProperties` rejects a non-string value for one.
+A genuinely date- or number-formatted Excel cell comes back from `exceljs` as a JS `Date` or
+`number`, not a string, so `xlsxCellToString()` renders every cell type (including rich text,
+hyperlinks, and formula results) down to a plain string before it ever reaches mapping —
+otherwise a real partner date column would misfire as a validation error instead of ingesting.
+Date-only cells render as `yyyy-mm-dd` (matching this codebase's existing date-string
+convention, e.g. seed `Person.dob`); cells with a time component keep full ISO-8601.
+
+**Verified** against a real `.xlsx` file (not just unit-tested): a 4-row upload with one row
+missing the required `name`-mapped column ingested the 3 valid rows, correctly rendered a
+date-formatted cell as `"1988-05-12"` in the stored object properties, and quarantined the
+invalid row with the same `missing required property "name"` error CSV rows get — same pipeline,
+same failure mode. Resumability was verified the same way #38 verified it for CSV: uploaded a
+3,000-row `.xlsx`, killed the server at 1,500 rows durably committed, restarted, resumed with the
+same file via `/resume`, and confirmed exactly 3,000 total objects with zero duplicates.
+**Source:** `api/src/routes/ingestion.ts`, `api/package.json`, `web/src/IntakePage.tsx`
+
+### #48 — Retention enforcement anonymizes via UPDATE, never deletes (PRD v1.1 N4)
+
+**Choice:** A scheduled sweep (`api/src/retention.ts`, in-process `setInterval`, no new
+infrastructure) finds objects/edges whose sole contributing source has a `retention_days`
+policy and whose last-ingested timestamp is older than that window, then clears
+`properties` to `{"_retention_anonymized_at": "<timestamp>"}` via `UPDATE` — the row, its id,
+its edges, and any case linkage all stay intact. Runs as a dedicated system `app_users` row
+(`00000000-0000-0000-0000-000000000001`, migration 014) at `RESTRICTED` clearance, batched
+500 rows/transaction like ingestion's chunking (#37). An object/edge still pinned to a
+currently-open (`open`/`under_review`) case is skipped regardless of how expired it is — an
+active investigation's legitimate purpose overrides the data-minimization deadline. An admin
+can also trigger a sweep on demand (`POST /admin/retention/run`, purpose-of-use required same
+as the role/clearance route) and see run history (`GET /admin/retention/runs`).
+
+**Reason:** `retention_days` has been stored per source since 009 but never applied — N4 in
+the PRD, and the gap README's "Beyond Phase 6" section named as worse than not claiming a
+retention policy at all.
+
+**Rejected: hard delete.** 005 deliberately grants `app_user` no `DELETE` on
+`objects`/`edges`/`object_property_meta` at all — "read/write, never delete (merges use
+`canonical_of`; cases close, they don't disappear)." Adding a `DELETE` grant + RLS policy to
+make retention work would have silently reversed that Phase 0 decision. Anonymizing via
+`UPDATE` needed zero new grants on any of those three tables. `object_property_meta` itself is
+left untouched — which property keys existed, sourced from where, until when, is provenance
+metadata worth keeping even after the values themselves are gone; only the values move.
+
+**Bug caught during verification, not by inspection:** the sweep's final step (mark the run
+row complete, write the audit entry) ran the audit write under the *triggering* actor's
+identity while the surrounding transaction's session was the system actor — `write_audit_log`'s
+own actor-match guard (added for exactly this kind of mismatch) correctly rejected it. Fixed by
+always attributing the audit entry to the system actor and recording who actually asked for an
+out-of-schedule run in `details.triggeredBy` instead. Caught because the anonymizing `UPDATE`s
+run in their own earlier, already-committed transactions — the audit-write failure rolled back
+only the run-completion bookkeeping, not the underlying data change, which is what surfaced the
+bug on the very first real test rather than in code review.
+
+**Verified** against real data, not just the query in isolation: an object whose source's
+30-day window had elapsed anonymized correctly; a same-source object 5 days old did not; an
+object with no retention-policy source stayed untouched regardless of age; an equally-expired
+object pinned to an `open` case was correctly skipped. Restarted the server with a fresh
+expired object in place and confirmed the scheduled sweep anonymized it automatically within
+seconds of boot, with no manual trigger involved — the actual acceptance bar, not just the
+admin-triggered path. Audit hash-chain still valid after all of the above.
+**Source:** `db/migrations/014_retention_enforcement.sql`, `api/src/retention.ts`,
+`api/src/routes/admin.ts`, `web/src/IntakePage.tsx`
+
+### #49 — Shared Zod schemas for `GET /cases/:id`, closing the first route (PRD v1.1 N5)
+
+**Choice:** `shared/schemas/caseDetail.ts` — a new top-level directory, not an npm workspace —
+is the single source of truth for this route's request/response shape. `api/src/routes/cases/
+workspace.ts` validates the request query/params and the constructed response against it before
+`reply.send(...)`; `web/src/lib/api/cases.ts`'s `getCase` validates the fetched JSON against the
+same schema via a new `requestWithSchema()` helper in `client.ts`. `web/src/lib/api/types.ts`'s
+`CaseEntity`/`CaseNote`/`CaseActivity`/`CaseMember`/`CaseDetail` are now re-exports of the
+schema's inferred types under their existing names, so no other file that imports them changed.
+`api` and `web` are two independent npm projects (no root `package.json`); `shared/` is wired in
+via each project's `tsconfig.json` `include` (plus `rootDir` in `api`'s, and `server.fs.allow` in
+`web/vite.config.ts`) rather than a package boundary — see `shared/README.md` for the exact
+mechanics and how to add the next route's schema.
+
+**Reason:** N5 in the PRD — `request<T>(...)` on the web side was (and everywhere except this
+one route still is) a bare type assertion with no runtime check, so a response shape change
+surfaces as a silent `undefined` wherever the missing field gets read, not a build failure.
+`GET /cases/:id` was chosen over `/graph/expand` (PLAN.md's other suggested candidate) because
+writing its schema immediately surfaced a real, pre-existing drift: the hand-written `CaseDetail`
+type's `case` field claimed `entity_count` (copied from the list endpoint's row shape, which
+does compute it via a subquery — `cases/queue.ts`), but `SELECT * FROM cases WHERE id = $1`
+(`cases/workspace.ts`) never returns it. Nothing read it from this response yet, so it was a
+live, silent trap rather than a caught bug — exactly the failure mode this phase exists to close.
+
+**Bugs the schema itself caught, not code review, on the very first real request:**
+1. Zod's default `.uuid()` enforces RFC4122 version/variant nibbles; this codebase's seed data
+   uses deliberately simple ids (`11111111-1111-1111-1111-111111111104` for `app_users`) that
+   are valid Postgres `uuid` values but fail that stricter check. Switched every id field to
+   `z.guid()` (hex-shape only, no version/variant requirement) — matching what the Postgres
+   column type itself actually enforces, not a tighter constraint invented on top of it.
+2. `pg` returns `timestamp`/`timestamptz` columns as JS `Date` objects, not strings; validating
+   the response *before* Fastify's `reply.send()` JSON-serializes it (the whole point — catching
+   a mismatch before anything ships, not after) means the schema saw raw `Date` values. Added an
+   `isoTimestampSchema` that accepts either and transforms to an ISO string, making explicit what
+   was previously an implicit, invisible side effect of `JSON.stringify`.
+
+**Verified**, not just asserted: the real case workspace page renders end-to-end through the
+validated round trip (screenshot-checked in a real browser, not just typecheck). Then
+deliberately renamed `author_name` → `authorName` in the shared schema only: `web`'s typecheck
+failed with a precise `TS2551` pointing at the exact consuming line in
+`CaseWorkspacePage.tsx`, and the live API request failed with a `500` and a Zod error naming the
+exact missing field — both directions of the acceptance bar, on the same real request, not two
+different contrived examples. Reverted; both green again.
+**Source:** `shared/schemas/caseDetail.ts`, `shared/README.md`, `api/src/routes/cases/
+workspace.ts`, `web/src/lib/api/cases.ts`, `web/src/lib/api/client.ts`, `web/src/lib/api/
+types.ts`, `api/tsconfig.json`, `web/tsconfig.json`, `web/vite.config.ts`
+
+**Follow-up, caught by CI rather than locally:** the PR's first CI run failed API typecheck —
+`shared/` is its own npm project (`shared/package.json`), and nothing had ever installed *its*
+dependencies; `zod` only resolved locally because `npm install` had been run there by hand
+during development. `.github/workflows/ci.yml` now installs `shared/`'s dependencies before the
+API/web typecheck steps, the same way it already does for `api/` and `web/` separately.
+Reproduced the exact failure locally first (`rm -rf shared/node_modules` then `npm run
+typecheck` in `api/`) before trusting the fix, rather than assuming the CI-only difference was
+what the log said it was.
+**Source:** `.github/workflows/ci.yml`
+
+### #50 — Deployment: a budget-interim Mac + Cloudflare-tunnel demo, not the real EU host (PRD v1.1 B7 part 1)
 
 **Choice:** No funds are currently available for Hetzner Cloud (the recommended EU host), so
 `deploy/run-ephemeral-demo.sh` runs the full stack in Docker on a personal machine, reachable

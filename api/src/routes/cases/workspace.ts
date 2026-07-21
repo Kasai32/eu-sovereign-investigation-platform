@@ -3,15 +3,24 @@ import type { FastifyPluginAsync } from "fastify";
 import { withRequestContext } from "../../db.js";
 import { writeAudit } from "../../audit.js";
 import { LOCKED_STATUSES } from "./shared.js";
+import { caseDetailRequestSchema, caseDetailResponseSchema } from "../../../../shared/schemas/caseDetail.js";
 
 // S2: case workspace — entities, notes, activity, members, graph seed, pin/unpin.
 const casesWorkspaceRoutes: FastifyPluginAsync = async (app) => {
-  // S2: case workspace — entities, notes, activity, members in one call.
+  // S2: case workspace — entities, notes, activity, members in one call. Request and response
+  // are both validated against shared/schemas/caseDetail.ts (PRD v1.1 N5) — the same schema
+  // web/src/lib/api/cases.ts validates the fetched JSON against, so a query change that no
+  // longer matches what the frontend expects throws here instead of shipping silently.
   app.get("/cases/:id", async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
-    const { id } = request.params as { id: string };
-    const { purpose } = request.query as { purpose?: string };
-    if (!purpose) return reply.code(400).send({ error: "purpose query param is required to open a case" });
+    const parsedRequest = caseDetailRequestSchema.safeParse({
+      id: (request.params as { id?: string }).id,
+      purpose: (request.query as { purpose?: string }).purpose,
+    });
+    if (!parsedRequest.success) {
+      return reply.code(400).send({ error: parsedRequest.error.issues[0]?.message ?? "invalid request" });
+    }
+    const { id, purpose } = parsedRequest.data;
 
     const result = await withRequestContext(request.ctx, async (client) => {
       const { rows: caseRows } = await client.query(`SELECT * FROM cases WHERE id = $1`, [id]);
@@ -55,7 +64,7 @@ const casesWorkspaceRoutes: FastifyPluginAsync = async (app) => {
     });
 
     if (!result) return reply.code(404).send({ error: "not found" });
-    reply.send(result);
+    reply.send(caseDetailResponseSchema.parse(result));
   });
 
   app.post("/cases/:id/notes", async (request, reply) => {

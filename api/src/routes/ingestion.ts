@@ -1,11 +1,83 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { FastifyPluginAsync } from "fastify";
+import type { FastifyBaseLogger, FastifyPluginAsync } from "fastify";
 import { parse } from "csv-parse/sync";
+import ExcelJS from "exceljs";
 import { pool, withRequestContext, type RequestContext } from "../db.js";
 import { writeAudit } from "../audit.js";
 import { validateProperties, type PropertySchema } from "../objectValidation.js";
 
 const PRIVILEGED_ROLES = ["supervisor", "compliance", "admin"];
+
+const XLSX_FILENAME = /\.xlsx$/i;
+
+// Renders one xlsx cell down to the same plain string every property downstream expects (CSV
+// rows are already all-string via csv-parse). Every ontology property is schema'd as `"type":
+// "string"` (db/seed/001_object_types.sql) and validateProperties rejects a non-string value for
+// one — a raw JS Date or number from a genuinely date/number-formatted Excel cell would
+// otherwise misfire as a validation error instead of ingesting.
+function xlsxCellToString(value: ExcelJS.CellValue): string {
+  if (value === null || value === undefined) return "";
+  if (value instanceof Date) {
+    const isDateOnly =
+      value.getUTCHours() === 0 && value.getUTCMinutes() === 0 && value.getUTCSeconds() === 0 && value.getUTCMilliseconds() === 0;
+    return isDateOnly ? value.toISOString().slice(0, 10) : value.toISOString();
+  }
+  if (typeof value === "object") {
+    // Rich text, hyperlink, and formula cells carry their display value under one of these
+    // keys instead of as the cell's raw value.
+    const obj = value as { text?: unknown; result?: unknown; richText?: { text: string }[] };
+    if (typeof obj.text === "string") return obj.text;
+    if (obj.richText) return obj.richText.map((r) => r.text).join("");
+    if (obj.result !== undefined && obj.result !== null) return String(obj.result);
+    return "";
+  }
+  return String(value);
+}
+
+// Reads the first worksheet's first row as headers and every row after as a record keyed by
+// those headers — the same {csv column name: string value} shape csv-parse produces, so
+// everything downstream (mapping, validation, entity resolution, quarantine, resume) never has
+// to know which file format a run started from.
+async function parseXlsx(buffer: Buffer): Promise<Record<string, string>[]> {
+  const workbook = new ExcelJS.Workbook();
+  // exceljs's bundled .d.ts declares its own ambient `Buffer extends ArrayBuffer`, which
+  // collides with @types/node's real (generic) Buffer in the global scope — `Buffer` in
+  // .load()'s own signature now names that broken merged type, so even a genuine Node Buffer
+  // fails this call's type check even though it's exactly what .load() expects and handles at
+  // runtime. `Buffer` itself can't be used to cast past this; only `any` escapes it.
+  await workbook.xlsx.load(buffer as any);
+  const worksheet = workbook.worksheets[0];
+  if (!worksheet) return [];
+
+  const headers: string[] = [];
+  worksheet.getRow(1).eachCell({ includeEmpty: true }, (cell, colNumber) => {
+    headers[colNumber] = xlsxCellToString(cell.value).trim();
+  });
+
+  const records: Record<string, string>[] = [];
+  worksheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    const record: Record<string, string> = {};
+    let hasValue = false;
+    row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+      const header = headers[colNumber];
+      if (!header) return;
+      const value = xlsxCellToString(cell.value);
+      if (value !== "") hasValue = true;
+      record[header] = value;
+    });
+    if (hasValue) records.push(record);
+  });
+  return records;
+}
+
+// Single entry point for turning an uploaded file into rows, dispatching on filename extension
+// (blueprint scope: CSV or XLSX, disclosed as a cut corner in the PRD until now — no live
+// connectors either way, still a file upload).
+async function parseIngestionFile(buffer: Buffer, filename: string): Promise<Record<string, string>[]> {
+  if (XLSX_FILENAME.test(filename)) return parseXlsx(buffer);
+  return parse(buffer, { columns: true, skip_empty_lines: true, trim: true });
+}
 
 // Fuzzy-match thresholds for entity resolution against existing objects of the same type.
 // Above AUTO_MERGE: confident enough to merge automatically (reversible via canonical_of).
@@ -39,26 +111,36 @@ type EdgeTemplate = {
   default_classification: string;
 };
 
-// Runs one advisory-lock-guarded critical section per ingestion run id. Two concurrent
-// attempts to process the same run — the ordinary case (this request is still legitimately
-// working through chunks) racing an operator's premature "resume" click, or two resume clicks
-// racing each other — would otherwise both read the same checkpoint and process the same rows
-// twice, creating duplicate objects. A session-scoped advisory lock on a dedicated connection,
-// held for this call's whole duration (not per-chunk-transaction, which would only guard a
-// single chunk), makes a second concurrent attempt fail fast instead of racing.
-async function withRunLock<T>(runId: string, fn: () => Promise<T>): Promise<{ locked: true; result: T } | { locked: false }> {
+// Guards one advisory-lock-protected critical section per ingestion run id. Two concurrent
+// attempts to process the same run — the ordinary case (a run still legitimately working
+// through chunks in the background) racing an operator's premature "resume" click, or two
+// resume clicks racing each other — would otherwise both read the same checkpoint and process
+// the same rows twice, creating duplicate objects. A session-scoped advisory lock on a
+// dedicated connection makes a second concurrent attempt fail fast instead of racing.
+//
+// Lock acquisition is split from lock-guarded execution (unlike the single all-in-one helper
+// this replaced) so a route handler can learn synchronously whether it won the lock — needed
+// to keep returning an immediate 409 on a real concurrent attempt (verified in DECISIONS.md
+// #38) — while the actual chunk processing runs after the HTTP response is already sent. The
+// lock's connection is held for as long as processing takes either way; only the client-facing
+// request no longer waits on it.
+async function tryAcquireRunLock(runId: string): Promise<{ locked: true; release: () => Promise<void> } | { locked: false }> {
   const lockClient = await pool.connect();
-  try {
-    const { rows } = await lockClient.query<{ acquired: boolean }>(`SELECT pg_try_advisory_lock(hashtext($1)::bigint) AS acquired`, [runId]);
-    if (!rows[0].acquired) return { locked: false };
-    try {
-      return { locked: true, result: await fn() };
-    } finally {
-      await lockClient.query(`SELECT pg_advisory_unlock(hashtext($1)::bigint)`, [runId]);
-    }
-  } finally {
+  const { rows } = await lockClient.query<{ acquired: boolean }>(`SELECT pg_try_advisory_lock(hashtext($1)::bigint) AS acquired`, [runId]);
+  if (!rows[0].acquired) {
     lockClient.release();
+    return { locked: false };
   }
+  return {
+    locked: true,
+    release: async () => {
+      try {
+        await lockClient.query(`SELECT pg_advisory_unlock(hashtext($1)::bigint)`, [runId]);
+      } finally {
+        lockClient.release();
+      }
+    },
+  };
 }
 
 // Processes records[startAt..] in CHUNK_SIZE-row transactions, checkpointing ingestion_runs
@@ -308,6 +390,48 @@ async function finalizeRun(ctx: RequestContext, runId: string, filename: string)
   });
 }
 
+// Same shape GET /ingestion/runs already lists (raw ingestion_runs columns plus the joined
+// source/template display names) — used for the single-run snapshot a create/resume response
+// hands back immediately, before background processing has done anything yet.
+async function fetchRunSummary(ctx: RequestContext, runId: string) {
+  return withRequestContext(ctx, async (client) => {
+    const { rows } = await client.query(
+      `SELECT r.*, s.name AS source_name, COALESCE(t.name, et.name) AS template_name
+       FROM ingestion_runs r
+       JOIN ingestion_sources s ON s.id = r.source_id
+       LEFT JOIN column_mapping_templates t ON t.id = r.template_id
+       LEFT JOIN edge_mapping_templates et ON et.id = r.edge_template_id
+       WHERE r.id = $1`,
+      [runId],
+    );
+    return rows[0];
+  });
+}
+
+// Kicks off chunk processing without the caller awaiting it, so a route handler can respond
+// (202, run already created/resumed) before any row is processed — B6: a real 50k-row run must
+// not hold the HTTP request or starve the connection pool for however long it takes. Errors are
+// handled here, not propagated, because nothing is listening on an HTTP response by the time
+// they'd occur; runIngestionChunks/runEdgeIngestionChunks already mark the run 'failed' on their
+// own internal errors, so a run's status is always observable via polling regardless of outcome.
+function processInBackground(
+  log: FastifyBaseLogger,
+  ctx: RequestContext,
+  runId: string,
+  filename: string,
+  releaseLock: () => Promise<void>,
+  runChunks: () => Promise<{ ok: true } | { ok: false; error: string }>,
+): void {
+  void runChunks()
+    .then(async (result) => {
+      if (result.ok) await finalizeRun(ctx, runId, filename);
+    })
+    .catch((err) => log.error({ err, runId }, "unhandled error processing ingestion run in the background"))
+    .finally(() => {
+      void releaseLock().catch((err) => log.error({ err, runId }, "failed to release ingestion run lock"));
+    });
+}
+
 const ingestionRoutes: FastifyPluginAsync = async (app) => {
   app.get("/ingestion/sources", async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
@@ -509,18 +633,20 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
   // whole batch.
   app.post(
     "/ingestion/runs",
-    // Tighter than the 300/min global default (api/src/index.ts): a single run can hold a
-    // pooled connection through many chunked transactions in a row, unlike a cheap /search
-    // call — see DECISIONS.md #21.
+    // Tighter than the 300/min global default (api/src/index.ts): still limits how many large
+    // background runs a client can kick off in a row, even though the request itself now
+    // returns as soon as the run is created rather than waiting for processing — see
+    // DECISIONS.md #21.
     { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
     async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
-    if (!PRIVILEGED_ROLES.includes(request.ctx.actorRole)) {
+    const ctx = request.ctx;
+    if (!PRIVILEGED_ROLES.includes(ctx.actorRole)) {
       return reply.code(403).send({ error: "ingestion is restricted to supervisor/compliance/admin roles" });
     }
 
     const filePart = await request.file();
-    if (!filePart) return reply.code(400).send({ error: "a CSV file is required" });
+    if (!filePart) return reply.code(400).send({ error: "a CSV or XLSX file is required" });
     const sourceId = (filePart.fields.sourceId as { value?: string } | undefined)?.value;
     const templateId = (filePart.fields.templateId as { value?: string } | undefined)?.value;
     const edgeTemplateId = (filePart.fields.edgeTemplateId as { value?: string } | undefined)?.value;
@@ -529,17 +655,17 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const buffer = await filePart.toBuffer();
+    const filename = filePart.filename ?? "upload";
     let records: Record<string, string>[];
     try {
-      records = parse(buffer, { columns: true, skip_empty_lines: true, trim: true });
+      records = await parseIngestionFile(buffer, filename);
     } catch (err) {
-      return reply.code(400).send({ error: `could not parse CSV: ${err instanceof Error ? err.message : String(err)}` });
+      return reply.code(400).send({ error: `could not parse the uploaded file: ${err instanceof Error ? err.message : String(err)}` });
     }
     const fileHash = createHash("sha256").update(buffer).digest("hex");
-    const filename = filePart.filename ?? "upload.csv";
 
     if (edgeTemplateId) {
-      const setup = await withRequestContext(request.ctx, async (client) => {
+      const setup = await withRequestContext(ctx, async (client) => {
         const { rows: sourceRows } = await client.query(`SELECT * FROM ingestion_sources WHERE id = $1`, [sourceId]);
         const { rows: templateRows } = await client.query(`SELECT * FROM edge_mapping_templates WHERE id = $1`, [edgeTemplateId]);
         if (sourceRows.length === 0 || templateRows.length === 0) return { error: "unknown source or edge template" as const };
@@ -548,7 +674,7 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
         await client.query(
           `INSERT INTO ingestion_runs (id, source_id, edge_template_id, filename, status, records_total, started_by, file_hash)
            VALUES ($1, $2, $3, $4, 'running', $5, $6, $7)`,
-          [runId, sourceId, edgeTemplateId, filename, records.length, request.ctx!.userId, fileHash],
+          [runId, sourceId, edgeTemplateId, filename, records.length, ctx.userId, fileHash],
         );
         return { source: sourceRows[0], edgeTemplate: templateRows[0], runId };
       });
@@ -556,20 +682,20 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
       if ("error" in setup) return reply.code(400).send({ error: setup.error });
       const { source, edgeTemplate, runId } = setup;
 
-      const chunkResult = await withRunLock(runId, () =>
-        runEdgeIngestionChunks(request.ctx!, runId, records, 0, edgeTemplate as EdgeTemplate, source),
-      );
-      if (!chunkResult.locked) {
+      // A brand-new run's id can't already be locked by anything else — this can only fail if
+      // something is structurally wrong — but it's handled the same defensive way as the resume
+      // endpoint's real concurrent-attempt case, for consistency.
+      const lock = await tryAcquireRunLock(runId);
+      if (!lock.locked) {
         return reply.code(409).send({ error: "could not acquire processing lock for this run" });
       }
-      if (!chunkResult.result.ok) {
-        return reply.code(500).send({ error: `ingestion run failed partway through: ${chunkResult.result.error}` });
-      }
-      const finalRun = await finalizeRun(request.ctx, runId, filename);
-      return reply.code(201).send(finalRun);
+      processInBackground(app.log, ctx, runId, filename, lock.release, () =>
+        runEdgeIngestionChunks(ctx, runId, records, 0, edgeTemplate as EdgeTemplate, source),
+      );
+      return reply.code(202).send(await fetchRunSummary(ctx, runId));
     }
 
-    const setup = await withRequestContext(request.ctx, async (client) => {
+    const setup = await withRequestContext(ctx, async (client) => {
       const { rows: sourceRows } = await client.query(`SELECT * FROM ingestion_sources WHERE id = $1`, [sourceId]);
       const { rows: templateRows } = await client.query(`SELECT * FROM column_mapping_templates WHERE id = $1`, [templateId]);
       if (sourceRows.length === 0 || templateRows.length === 0) return { error: "unknown source or template" as const };
@@ -583,7 +709,7 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
       await client.query(
         `INSERT INTO ingestion_runs (id, source_id, template_id, filename, status, records_total, started_by, file_hash)
          VALUES ($1, $2, $3, $4, 'running', $5, $6, $7)`,
-        [runId, sourceId, templateId, filename, records.length, request.ctx!.userId, fileHash],
+        [runId, sourceId, templateId, filename, records.length, ctx.userId, fileHash],
       );
 
       return { source, template, objectType, runId };
@@ -594,21 +720,14 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
     const schema = objectType.property_schema as PropertySchema;
     const mapping = template.mapping as Record<string, string>;
 
-    const chunkResult = await withRunLock(runId, () =>
-      runIngestionChunks(request.ctx!, runId, records, 0, schema, mapping, template, source),
-    );
-    // A brand-new run's id can't already be locked by anything else, so `locked: false` here
-    // would mean something is structurally wrong rather than a real contention case — but
-    // handle it the same defensive way as the resume endpoint for consistency.
-    if (!chunkResult.locked) {
+    const lock = await tryAcquireRunLock(runId);
+    if (!lock.locked) {
       return reply.code(409).send({ error: "could not acquire processing lock for this run" });
     }
-    if (!chunkResult.result.ok) {
-      return reply.code(500).send({ error: `ingestion run failed partway through: ${chunkResult.result.error}` });
-    }
-
-    const finalRun = await finalizeRun(request.ctx, runId, filename);
-    reply.code(201).send(finalRun);
+    processInBackground(app.log, ctx, runId, filename, lock.release, () =>
+      runIngestionChunks(ctx, runId, records, 0, schema, mapping, template, source),
+    );
+    reply.code(202).send(await fetchRunSummary(ctx, runId));
   });
 
   // Resumes a run stuck in 'running' (crashed mid-chunk — the server process died, so nothing
@@ -622,19 +741,20 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
     { config: { rateLimit: { max: 10, timeWindow: "1 minute" } } },
     async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
-    if (!PRIVILEGED_ROLES.includes(request.ctx.actorRole)) {
+    const ctx = request.ctx;
+    if (!PRIVILEGED_ROLES.includes(ctx.actorRole)) {
       return reply.code(403).send({ error: "ingestion is restricted to supervisor/compliance/admin roles" });
     }
     const { id: runId } = request.params as { id: string };
 
     const filePart = await request.file();
-    if (!filePart) return reply.code(400).send({ error: "the original CSV file must be re-uploaded to resume" });
+    if (!filePart) return reply.code(400).send({ error: "the original file must be re-uploaded to resume" });
     const buffer = await filePart.toBuffer();
     let records: Record<string, string>[];
     try {
-      records = parse(buffer, { columns: true, skip_empty_lines: true, trim: true });
+      records = await parseIngestionFile(buffer, filePart.filename ?? "upload");
     } catch (err) {
-      return reply.code(400).send({ error: `could not parse CSV: ${err instanceof Error ? err.message : String(err)}` });
+      return reply.code(400).send({ error: `could not parse the uploaded file: ${err instanceof Error ? err.message : String(err)}` });
     }
     const fileHash = createHash("sha256").update(buffer).digest("hex");
 
@@ -643,7 +763,7 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
       | { kind: "object"; run: Record<string, any>; source: IngestionSource; template: IngestionTemplate; objectType: { property_schema: PropertySchema }; startAt: number }
       | { kind: "edge"; run: Record<string, any>; source: IngestionSource; edgeTemplate: EdgeTemplate; startAt: number };
 
-    const setup = await withRequestContext(request.ctx, async (client): Promise<ResumeSetup> => {
+    const setup = await withRequestContext(ctx, async (client): Promise<ResumeSetup> => {
       const { rows: runRows } = await client.query(`SELECT * FROM ingestion_runs WHERE id = $1`, [runId]);
       if (runRows.length === 0) return { error: "not found", status: 404 };
       const run = runRows[0];
@@ -681,15 +801,19 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
     if (setup.startAt >= records.length) {
       // A prior attempt finished every chunk but crashed before its final status update — no
       // rows left to process, just finalize.
-      const finalRun = await finalizeRun(request.ctx, runId, filename);
+      const finalRun = await finalizeRun(ctx, runId, filename);
       return reply.send(finalRun);
     }
 
-    const chunkResult = await withRunLock(runId, () =>
+    const lock = await tryAcquireRunLock(runId);
+    if (!lock.locked) {
+      return reply.code(409).send({ error: "this run is currently being processed (already resuming, or the original request is still running) — try again shortly" });
+    }
+    processInBackground(app.log, ctx, runId, filename, lock.release, () =>
       setup.kind === "edge"
-        ? runEdgeIngestionChunks(request.ctx!, runId, records, setup.startAt, setup.edgeTemplate, setup.source)
+        ? runEdgeIngestionChunks(ctx, runId, records, setup.startAt, setup.edgeTemplate, setup.source)
         : runIngestionChunks(
-            request.ctx!,
+            ctx,
             runId,
             records,
             setup.startAt,
@@ -699,15 +823,7 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
             setup.source,
           ),
     );
-    if (!chunkResult.locked) {
-      return reply.code(409).send({ error: "this run is currently being processed (already resuming, or the original request is still running) — try again shortly" });
-    }
-    if (!chunkResult.result.ok) {
-      return reply.code(500).send({ error: `ingestion run failed partway through resume: ${chunkResult.result.error}` });
-    }
-
-    const finalRun = await finalizeRun(request.ctx, runId, filename);
-    reply.send(finalRun);
+    reply.code(202).send(await fetchRunSummary(ctx, runId));
   });
 };
 

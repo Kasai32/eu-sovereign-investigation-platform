@@ -12,6 +12,7 @@ import objectTypesRoutes from "./routes/objectTypes.js";
 import ingestionRoutes from "./routes/ingestion.js";
 import resolutionQueueRoutes from "./routes/resolutionQueue.js";
 import adminRoutes from "./routes/admin.js";
+import { scheduleRetentionSweep } from "./retention.js";
 
 const MULTIPART_FILE_SIZE_LIMIT = 10 * 1024 * 1024; // 10MB, see the multipart registration below
 
@@ -51,6 +52,8 @@ app.register(async (secured) => {
   await secured.register(resolutionQueueRoutes);
   await secured.register(adminRoutes);
 });
+
+scheduleRetentionSweep(app.log);
 
 const port = Number(process.env.PORT ?? 3001);
 app.listen({ port, host: "0.0.0.0" }).catch((err) => {
