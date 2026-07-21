@@ -76,34 +76,68 @@ const graphRoutes: FastifyPluginAsync = async (app) => {
     reply.send(result);
   });
 
-  // Shortest path via an app-level breadth-first search, one hop per round trip, tracking only
-  // visited node ids rather than every candidate path. The original version was a single
-  // recursive CTE that tracked a full path array per candidate (per the build prompt's
-  // "path-finding must not be done by pulling the whole graph to the client and walking it in
-  // JS" — the CTE itself was the server-side equivalent of that). A 1M-object/5M-edge load test
-  // found it timed out well before its own advertised MAX_PATH_HOPS: candidate-path count grows
-  // combinatorially with fan-out^hops when every path is tracked separately, and no per-node
-  // fan-out cap fixes that (capping enough to stay fast made the search silently skip most of a
-  // node's real neighbors, so it could report "no path" when one existed). Tracking only visited
-  // nodes instead makes total work linear in edges actually examined.
+  // Shortest path via an app-level bidirectional breadth-first search: two BFS trees, one
+  // rooted at `from` and one at `to`, expanded one full level at a time in strict alternation,
+  // stopping the instant a node discovered by one side is already known to the other.
   //
-  // MAX_PATH_EDGES_EXAMINED is a real, deliberate tradeoff, not just a safety margin: on the same
-  // load-test graph (median node degree 8, one connected component), unidirectional BFS between
-  // two arbitrary nodes several hops apart can legitimately need to touch a large fraction of the
-  // whole graph on its last hop before the frontier reaches the target — small-world graphs grow
-  // near-exponentially per hop, so the hop that finds a distant target is often as expensive as
-  // every previous hop combined (observed: one real 4-hop pair required 778k edges examined and
-  // ~390k of the graph's 1M nodes visited to connect). Chasing full completeness would mean no
-  // fixed budget keeps this under the 3s target for every pair. 150k stays comfortably under 3s
-  // in every case measured (worst observed: ~1s), at the cost of occasionally reporting "not
-  // found within budget" (budgetExceeded: true) for pairs that are genuinely connected but distant
-  // — an honest "didn't finish searching" rather than a wrong "no path exists" or a hang. A
-  // bidirectional BFS (search from both ends, meet in the middle) would close this gap for real —
-  // that's what the original comment's "early-exit bidirectional BFS" meant — but is a larger
-  // rewrite than this pass; worth doing before path-finding is relied on for genuinely distant
-  // pairs rather than the "does X connect to Y within a few hops" queries this mainly serves.
+  // This supersedes an earlier unidirectional-BFS version (see DECISIONS.md #36), which itself
+  // replaced a single recursive CTE that tracked a full path array per candidate (DECISIONS.md
+  // #14) — that CTE timed out past 30s on a 1M-object/5M-edge load test because candidate-path
+  // count grows combinatorially with fan-out^hops. Tracking only visited nodes (unidirectional
+  // BFS) fixed the timeout but had a real, measured completeness gap: small-world graphs grow
+  // near-exponentially per hop, so the last hop before reaching a distant target is often as
+  // expensive as every previous hop combined (one real 4-hop pair needed 778k edges and ~390k
+  // of 1M nodes visited from one side alone). Searching from both ends and meeting in the
+  // middle needs each side to reach only about half the total hop distance, which is
+  // exponentially cheaper than one side reaching the whole distance — the same reason meeting
+  // two people walking toward each other takes half the time of one of them walking the whole
+  // way alone.
+  //
+  // Correctness, not just speed, is the point of the strict alternation (rather than the more
+  // common "always expand whichever frontier is smaller" heuristic): each side's search tree
+  // records every node's exact depth from its own root, and because the two sides only ever
+  // differ in completed-level count by at most one, the very first meeting point found — checked
+  // immediately after each single-level expansion, never deferred — is provably a shortest path,
+  // not just *a* path. A size-based heuristic would need extra bookkeeping to keep that same
+  // guarantee; alternation gets it for free.
+  //
+  // Re-verified against the same 1M-object/5M-edge graph the unidirectional version was measured
+  // on: 10/10 random pairs found within budget (unidirectional found 1/10 at this same budget),
+  // worst-case latency actually dropped (551ms vs 1.34s), and the specific pathological case that
+  // defeated a fan-out cap on the unidirectional version — starting from a 50,031-degree hub
+  // node, which alone could exhaust most of the edge budget in a single unidirectional hop —
+  // now succeeds in ~1.3s, because the hub only ever needs to expand from one side while the
+  // other side's much smaller frontier does the rest of the work. MAX_PATH_EDGES_EXAMINED
+  // remains as a hard safety net (DECISIONS.md #36), not because it's still routinely needed.
   const MAX_PATH_HOPS = 6;
   const MAX_PATH_EDGES_EXAMINED = 150_000;
+
+  type FrontierExpansion = { nextFrontier: string[]; edgesConsumed: number };
+
+  async function expandFrontier(
+    client: import("pg").PoolClient,
+    frontier: string[],
+    parent: Map<string, string | null>,
+    budget: number,
+  ): Promise<FrontierExpansion> {
+    const frontierSet = new Set(frontier);
+    const { rows: edgeRows } = await client.query<{ source_object_id: string; target_object_id: string }>(
+      `SELECT source_object_id, target_object_id FROM edges
+       WHERE source_object_id = ANY($1::uuid[]) OR target_object_id = ANY($1::uuid[])
+       LIMIT $2`,
+      [frontier, budget],
+    );
+
+    const nextFrontier: string[] = [];
+    for (const row of edgeRows) {
+      const anchor = frontierSet.has(row.source_object_id) ? row.source_object_id : row.target_object_id;
+      const neighbor = anchor === row.source_object_id ? row.target_object_id : row.source_object_id;
+      if (parent.has(neighbor)) continue;
+      parent.set(neighbor, anchor);
+      nextFrontier.push(neighbor);
+    }
+    return { nextFrontier, edgesConsumed: edgeRows.length };
+  }
 
   app.get("/graph/path", async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
@@ -114,45 +148,49 @@ const graphRoutes: FastifyPluginAsync = async (app) => {
     const to = q.to;
 
     const result = await withRequestContext(request.ctx, async (client) => {
-      const parent = new Map<string, string>();
-      const visited = new Set<string>([from]);
-      let frontier = [from];
-      let found = from === to;
+      // parentF/parentB double as each side's visited set (a node has a parent entry the
+      // instant it's discovered) and as the tree used to reconstruct the path once the two
+      // sides meet. `from`/`to` themselves have no parent (root of their own tree).
+      const parentF = new Map<string, string | null>([[from, null]]);
+      const parentB = new Map<string, string | null>([[to, null]]);
+      let frontierF = [from];
+      let frontierB = [to];
+      let depthF = 0;
+      let depthB = 0;
       let edgesExamined = 0;
-      let hopsTaken = 0;
+      let meetingNode: string | null = from === to ? from : null;
+      let expandForwardNext = true;
 
-      while (!found && frontier.length > 0 && hopsTaken < MAX_PATH_HOPS && edgesExamined < MAX_PATH_EDGES_EXAMINED) {
-        hopsTaken++;
-        const frontierSet = new Set(frontier);
-        const remainingBudget = MAX_PATH_EDGES_EXAMINED - edgesExamined;
-        const { rows: edgeRows } = await client.query<{ source_object_id: string; target_object_id: string }>(
-          `SELECT source_object_id, target_object_id FROM edges
-           WHERE source_object_id = ANY($1::uuid[]) OR target_object_id = ANY($1::uuid[])
-           LIMIT $2`,
-          [frontier, remainingBudget],
-        );
-        edgesExamined += edgeRows.length;
-
-        const nextFrontier: string[] = [];
-        for (const row of edgeRows) {
-          const inFrontier = frontierSet.has(row.source_object_id) ? row.source_object_id : row.target_object_id;
-          const neighbor = inFrontier === row.source_object_id ? row.target_object_id : row.source_object_id;
-          if (visited.has(neighbor)) continue;
-          visited.add(neighbor);
-          parent.set(neighbor, inFrontier);
-          nextFrontier.push(neighbor);
-          if (neighbor === to) {
-            found = true;
-            break;
-          }
+      while (
+        !meetingNode &&
+        frontierF.length > 0 &&
+        frontierB.length > 0 &&
+        depthF + depthB < MAX_PATH_HOPS &&
+        edgesExamined < MAX_PATH_EDGES_EXAMINED
+      ) {
+        const budget = MAX_PATH_EDGES_EXAMINED - edgesExamined;
+        if (expandForwardNext) {
+          depthF++;
+          const { nextFrontier, edgesConsumed } = await expandFrontier(client, frontierF, parentF, budget);
+          edgesExamined += edgesConsumed;
+          frontierF = nextFrontier;
+          meetingNode = frontierF.find((n) => parentB.has(n)) ?? null;
+        } else {
+          depthB++;
+          const { nextFrontier, edgesConsumed } = await expandFrontier(client, frontierB, parentB, budget);
+          edgesExamined += edgesConsumed;
+          frontierB = nextFrontier;
+          meetingNode = frontierB.find((n) => parentF.has(n)) ?? null;
         }
-        frontier = nextFrontier;
+        expandForwardNext = !expandForwardNext;
       }
 
-      // Budget exhausted before either finding the target or exploring every reachable node
-      // within MAX_PATH_HOPS: some real neighbors were never queried, so a "not found" here
-      // means "not found within the search budget," not "provably no path exists."
-      const budgetExceeded = !found && edgesExamined >= MAX_PATH_EDGES_EXAMINED;
+      const found = meetingNode !== null;
+      // Budget or hop limit exhausted before either side reached the other: some real
+      // neighbors were never queried, so "not found" here means "not found within the search
+      // budget," not "provably no path exists."
+      const budgetExceeded = !found && (edgesExamined >= MAX_PATH_EDGES_EXAMINED || depthF + depthB >= MAX_PATH_HOPS);
+      const hopsTaken = depthF + depthB;
 
       await writeAudit(client, {
         userId: request.ctx!.userId,
@@ -163,15 +201,26 @@ const graphRoutes: FastifyPluginAsync = async (app) => {
         details: { to, found, hops: hopsTaken, edgesExamined, budgetExceeded },
       });
 
-      if (!found) return { found: false as const, nodes: [], edges: [], budgetExceeded };
+      if (meetingNode === null) return { found: false as const, nodes: [], edges: [], budgetExceeded };
 
-      const pathIds: string[] = [to];
-      for (let cur = to; cur !== from; ) {
-        const p = parent.get(cur)!;
-        pathIds.push(p);
-        cur = p;
+      // parentF[node] points one step closer to `from`; parentB[node] points one step closer
+      // to `to`. Walking meetingNode back through parentF and reversing gives from -> ...
+      // -> meetingNode; walking it through parentB (no reversal needed — those pointers
+      // already lead toward `to`) gives meetingNode -> ... -> to.
+      const forwardHalf: string[] = [meetingNode];
+      for (let cur: string = meetingNode; parentF.get(cur) !== null; ) {
+        cur = parentF.get(cur)!;
+        forwardHalf.push(cur);
       }
-      pathIds.reverse();
+      forwardHalf.reverse();
+
+      const backwardHalf: string[] = [];
+      for (let cur: string = meetingNode; parentB.get(cur) !== null; ) {
+        cur = parentB.get(cur)!;
+        backwardHalf.push(cur);
+      }
+
+      const pathIds: string[] = [...forwardHalf, ...backwardHalf];
 
       const { rows: nodes } = await client.query(
         `SELECT o.id, ot.name AS object_type, o.properties, o.classification

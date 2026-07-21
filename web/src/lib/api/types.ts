@@ -92,6 +92,8 @@ export type ObjectType = {
   version: number;
 };
 
+export type RelationshipType = { id: string; name: string };
+
 export type IngestionSource = {
   id: string;
   name: string;
@@ -110,10 +112,27 @@ export type MappingTemplate = {
   created_at: string;
 };
 
+export type EdgeMappingTemplate = {
+  id: string;
+  source_id: string;
+  name: string;
+  relationship_type_id: string;
+  source_object_type_id: string;
+  source_match_column: string;
+  source_match_property: string;
+  target_object_type_id: string;
+  target_match_column: string;
+  target_match_property: string;
+  property_mapping: Record<string, string>;
+  default_classification: string;
+  created_at: string;
+};
+
 export type IngestionRun = {
   id: string;
   source_id: string;
-  template_id: string;
+  template_id: string | null;
+  edge_template_id: string | null;
   source_name: string;
   template_name: string;
   filename: string;

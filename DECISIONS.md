@@ -390,10 +390,10 @@ tracking only grows linearly with edges actually examined.
 fan-out cap on the CTE.
 **Rejected because:** both reduce correctness (missing real paths or silently capping the
 feature's advertised reach) without fixing the underlying complexity class.
-**Status:** the new version has a known, accepted completeness limit — a fixed edge budget
-means genuinely distant pairs in a very densely connected graph can report "not found within
-budget" (honest, not wrong) rather than timing out. A true bidirectional BFS would close this
-gap fully; named as a future improvement in the code's own comment, not built this session.
+**Status:** **Superseded by #44.** The unidirectional version had a known, accepted completeness
+limit — a fixed edge budget meant genuinely distant pairs in a very densely connected graph
+could report "not found within budget" (honest, not wrong) rather than timing out. A true
+bidirectional BFS was named as the fix; it was built in the next session and closed the gap.
 **Source:** `api/src/routes/graph.ts`
 
 ### #37 — Ingestion chunked into per-500-row transactions with checkpointing, superseding #15
@@ -499,3 +499,56 @@ build it in.
 passed, including a fresh 12-migration apply that the existing local dev DB (already migrated)
 couldn't have exercised.
 **Source:** `.github/workflows/ci.yml`
+
+---
+
+## Next session — closing more open items (#11, #16, #17, #36)
+
+### #44 — `/graph/path` rewritten as bidirectional BFS, closing #36
+**Choice:** Replaced the unidirectional BFS (#36) with two BFS trees — one rooted at `from`,
+one at `to` — expanded one full level at a time in **strict alternation**, stopping the instant
+a node discovered by one side is already known to the other.
+**Reason:** Unidirectional BFS fixed the CTE's timeout but had a real completeness gap: the last
+hop before reaching a distant target in a small-world graph is often as expensive as every
+previous hop combined, since frontier size grows near-exponentially per hop. Searching from both
+ends means each side only needs to reach about half the total hop distance — exponentially
+cheaper than one side covering the whole distance.
+**Alternatives considered:** the more common "always expand whichever frontier is smaller"
+heuristic instead of strict alternation.
+**Rejected because:** strict alternation gives a shortest-path guarantee for free (both sides'
+completed-level counts never differ by more than one, so the first meeting point found is
+provably shortest); a size-based heuristic would need extra bookkeeping to keep that same
+guarantee, and getting that bookkeeping subtly wrong is exactly the kind of bug this whole
+`/graph/path` history (#14 → #36 → #44) has already been burned by twice.
+**Verified** against the same 1M-object/5M-edge graph #36 was measured on, not just unit-tested
+in isolation: 10/10 random pairs found within the same edge budget that only found 1/10 under
+unidirectional search; worst-case latency dropped (551ms vs 1.34s) despite finding far more
+paths; the specific case that defeated a fan-out cap on the unidirectional version — starting
+from a 50,031-degree hub node — now succeeds in ~1.3s instead of failing outright, since the hub
+only has to expand from one side while the other side's much smaller frontier does the rest.
+Also verified: the known 2-hop seed-data path from `PHASE3_REVIEW.md` still resolves correctly,
+a directly-connected pair reports exactly `hops: 1` (not an off-by-one from the meeting-point
+logic), and the trivial `from === to` case still short-circuits correctly.
+**Source:** `api/src/routes/graph.ts`
+
+### #45 — Edge-mapping ingestion templates, closing #16
+**Choice:** A new `edge_mapping_templates` table and `POST/GET /ingestion/edge-templates`
+alongside the existing object-mapping templates. An edge template never creates objects — each
+row must match an already-existing source and target object (by a configured property) via its
+own template, or the row quarantines. `POST /ingestion/runs` now accepts `edgeTemplateId` as an
+alternative to `templateId` (exactly one required); `ingestion_runs` gained a nullable
+`edge_template_id` column with a check constraint enforcing exactly one of the two is set.
+**Reason:** Named since `PHASE4_REVIEW.md`: "there's no way to ingest a CSV that creates edges
+(e.g., a transactions file mapping to `transacted_with` relationships between two existing
+accounts)... the seed data itself models transactions as edges." This was the one ingestion gap
+that was a missing capability, not a tuning/scale problem like the others closed so far.
+**Design note:** deliberately no auto-merge/entity-resolution equivalent for edge rows — there's
+nothing to merge when the row either matches an edge endpoint or it doesn't. Reuses the exact
+same chunking/checkpointing/resume infrastructure (#37/#38) as object ingestion, since the
+`records_ingested + records_quarantined` resume math doesn't care what kind of row was counted.
+**Verified** against real accounts in the seed data: a 3-row CSV (two valid transactions, one
+referencing a nonexistent account) produced exactly 2 edges with correctly mapped properties and
+classification, and 1 quarantined row with a precise "no matching target object" error. Also
+crashed a real 3,000-row edge-ingestion run at 1,000 rows and resumed it with the same file:
+completed at exactly 3,000 total edges, confirmed zero duplicates by direct count.
+**Source:** `db/migrations/013_edge_mapping_templates.sql`, `api/src/routes/ingestion.ts`

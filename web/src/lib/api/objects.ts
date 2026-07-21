@@ -1,5 +1,5 @@
 import { request, type WithToken } from "./client";
-import type { ObjectDetail, ObjectSummary, ObjectType } from "./types";
+import type { ObjectDetail, ObjectSummary, ObjectType, RelationshipType } from "./types";
 
 export function createObjectsApi(withToken: WithToken) {
   return {
@@ -18,5 +18,8 @@ export function createObjectsApi(withToken: WithToken) {
       ),
 
     listObjectTypes: () => withToken((token) => request<{ objectTypes: ObjectType[] }>("/object-types", token)),
+
+    listRelationshipTypes: () =>
+      withToken((token) => request<{ relationshipTypes: RelationshipType[] }>("/relationship-types", token)),
   };
 }

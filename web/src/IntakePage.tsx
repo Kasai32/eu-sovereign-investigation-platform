@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useApiClient, type MappingTemplate } from "./lib/api";
+import { useApiClient, type EdgeMappingTemplate, type MappingTemplate } from "./lib/api";
 import { useAuth } from "./lib/AuthContext";
 import { ClassificationBadge } from "./components/ClassificationBadge";
 
@@ -14,7 +14,9 @@ export function IntakePage() {
 
   const sourcesQuery = useQuery({ queryKey: ["ingestion-sources"], queryFn: () => api.listIngestionSources() });
   const templatesQuery = useQuery({ queryKey: ["ingestion-templates"], queryFn: () => api.listMappingTemplates() });
+  const edgeTemplatesQuery = useQuery({ queryKey: ["ingestion-edge-templates"], queryFn: () => api.listEdgeTemplates() });
   const objectTypesQuery = useQuery({ queryKey: ["object-types"], queryFn: () => api.listObjectTypes() });
+  const relationshipTypesQuery = useQuery({ queryKey: ["relationship-types"], queryFn: () => api.listRelationshipTypes() });
   const runsQuery = useQuery({ queryKey: ["ingestion-runs"], queryFn: () => api.listIngestionRuns() });
 
   const [newSourceName, setNewSourceName] = useState("");
@@ -47,13 +49,48 @@ export function IntakePage() {
     },
   });
 
+  const [edgeTemplateName, setEdgeTemplateName] = useState("");
+  const [edgeTemplateSourceId, setEdgeTemplateSourceId] = useState("");
+  const [relationshipTypeId, setRelationshipTypeId] = useState("");
+  const [sourceObjectTypeId, setSourceObjectTypeId] = useState("");
+  const [sourceMatchColumn, setSourceMatchColumn] = useState("");
+  const [sourceMatchProperty, setSourceMatchProperty] = useState("");
+  const [targetObjectTypeId, setTargetObjectTypeId] = useState("");
+  const [targetMatchColumn, setTargetMatchColumn] = useState("");
+  const [targetMatchProperty, setTargetMatchProperty] = useState("");
+  const [edgePropertyMappingRows, setEdgePropertyMappingRows] = useState<[string, string][]>([["", ""]]);
+  const createEdgeTemplate = useMutation({
+    mutationFn: () =>
+      api.createEdgeTemplate({
+        sourceId: edgeTemplateSourceId,
+        name: edgeTemplateName,
+        relationshipTypeId,
+        sourceObjectTypeId,
+        sourceMatchColumn,
+        sourceMatchProperty,
+        targetObjectTypeId,
+        targetMatchColumn,
+        targetMatchProperty,
+        propertyMapping: Object.fromEntries(edgePropertyMappingRows.filter(([c, p]) => c && p)),
+      }),
+    onSuccess: () => {
+      setEdgeTemplateName("");
+      setEdgePropertyMappingRows([["", ""]]);
+      queryClient.invalidateQueries({ queryKey: ["ingestion-edge-templates"] });
+    },
+  });
+
   const [uploadSourceId, setUploadSourceId] = useState("");
+  const [uploadKind, setUploadKind] = useState<"object" | "edge">("object");
   const [uploadTemplateId, setUploadTemplateId] = useState("");
+  const [uploadEdgeTemplateId, setUploadEdgeTemplateId] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const runIngestion = useMutation({
     mutationFn: () => {
       if (!file) throw new Error("choose a file first");
-      return api.runIngestion(uploadSourceId, uploadTemplateId, file);
+      return uploadKind === "edge"
+        ? api.runEdgeIngestion(uploadSourceId, uploadEdgeTemplateId, file)
+        : api.runIngestion(uploadSourceId, uploadTemplateId, file);
     },
     onSuccess: () => {
       setFile(null);
@@ -84,6 +121,7 @@ export function IntakePage() {
   }
 
   const templatesForUploadSource = (templatesQuery.data?.templates ?? []).filter((t) => t.source_id === uploadSourceId);
+  const edgeTemplatesForUploadSource = (edgeTemplatesQuery.data?.templates ?? []).filter((t) => t.source_id === uploadSourceId);
 
   return (
     <div className="mx-auto max-w-5xl space-y-8">
@@ -93,6 +131,30 @@ export function IntakePage() {
       {canIngest && (
         <section className="rounded border border-slate-200 bg-white p-4">
           <h2 className="mb-3 text-sm font-semibold text-slate-700">Upload CSV</h2>
+          <div className="mb-2 flex gap-3 text-xs text-slate-600">
+            <label className="flex items-center gap-1">
+              <input
+                type="radio"
+                checked={uploadKind === "object"}
+                onChange={() => {
+                  setUploadKind("object");
+                  setUploadEdgeTemplateId("");
+                }}
+              />
+              Ingest as objects
+            </label>
+            <label className="flex items-center gap-1">
+              <input
+                type="radio"
+                checked={uploadKind === "edge"}
+                onChange={() => {
+                  setUploadKind("edge");
+                  setUploadTemplateId("");
+                }}
+              />
+              Ingest as edges (connect existing objects)
+            </label>
+          </div>
           <div className="flex flex-wrap items-end gap-2">
             <label className="text-xs text-slate-500">
               Source
@@ -101,6 +163,7 @@ export function IntakePage() {
                 onChange={(e) => {
                   setUploadSourceId(e.target.value);
                   setUploadTemplateId("");
+                  setUploadEdgeTemplateId("");
                 }}
                 className="block rounded border border-slate-300 px-2 py-1 text-sm"
               >
@@ -114,24 +177,45 @@ export function IntakePage() {
             </label>
             <label className="text-xs text-slate-500">
               Template
-              <select
-                value={uploadTemplateId}
-                onChange={(e) => setUploadTemplateId(e.target.value)}
-                className="block rounded border border-slate-300 px-2 py-1 text-sm"
-                disabled={!uploadSourceId}
-              >
-                <option value="">Select…</option>
-                {templatesForUploadSource.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    {t.name}
-                  </option>
-                ))}
-              </select>
+              {uploadKind === "object" ? (
+                <select
+                  value={uploadTemplateId}
+                  onChange={(e) => setUploadTemplateId(e.target.value)}
+                  className="block rounded border border-slate-300 px-2 py-1 text-sm"
+                  disabled={!uploadSourceId}
+                >
+                  <option value="">Select…</option>
+                  {templatesForUploadSource.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <select
+                  value={uploadEdgeTemplateId}
+                  onChange={(e) => setUploadEdgeTemplateId(e.target.value)}
+                  className="block rounded border border-slate-300 px-2 py-1 text-sm"
+                  disabled={!uploadSourceId}
+                >
+                  <option value="">Select…</option>
+                  {edgeTemplatesForUploadSource.map((t) => (
+                    <option key={t.id} value={t.id}>
+                      {t.name}
+                    </option>
+                  ))}
+                </select>
+              )}
             </label>
             <input type="file" accept=".csv" onChange={(e) => setFile(e.target.files?.[0] ?? null)} className="text-sm" />
             <button
               onClick={() => runIngestion.mutate()}
-              disabled={!file || !uploadSourceId || !uploadTemplateId || runIngestion.isPending}
+              disabled={
+                !file ||
+                !uploadSourceId ||
+                (uploadKind === "object" ? !uploadTemplateId : !uploadEdgeTemplateId) ||
+                runIngestion.isPending
+              }
               className="rounded bg-slate-900 px-4 py-1.5 text-sm text-white hover:bg-slate-700 disabled:opacity-50"
             >
               {runIngestion.isPending ? "Ingesting…" : "Ingest"}
@@ -334,6 +418,173 @@ export function IntakePage() {
             </div>
             <button type="submit" className="rounded bg-slate-100 px-3 py-1 text-sm hover:bg-slate-200">
               Save template
+            </button>
+          </form>
+        )}
+      </section>
+
+      {/* Edge mapping templates */}
+      <section className="rounded border border-slate-200 bg-white p-4">
+        <h2 className="mb-3 text-sm font-semibold text-slate-700">Edge mapping templates</h2>
+        <p className="mb-3 text-xs text-slate-500">
+          Ingest a CSV as edges between existing objects (e.g. a transactions file) instead of new objects. A row that
+          doesn't match an existing source and target object quarantines — edge ingestion never creates objects.
+        </p>
+        <ul className="mb-3 space-y-1 text-sm">
+          {edgeTemplatesQuery.data?.templates.map((t: EdgeMappingTemplate) => (
+            <li key={t.id}>
+              {t.name} — matches source on <code className="text-xs">{t.source_match_column}</code>/
+              <code className="text-xs">{t.source_match_property}</code>, target on{" "}
+              <code className="text-xs">{t.target_match_column}</code>/<code className="text-xs">{t.target_match_property}</code>
+            </li>
+          ))}
+          {(edgeTemplatesQuery.data?.templates.length ?? 0) === 0 && <li className="text-slate-400">No edge templates yet.</li>}
+        </ul>
+        {isAdmin && (
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (
+                edgeTemplateName.trim() &&
+                edgeTemplateSourceId &&
+                relationshipTypeId &&
+                sourceObjectTypeId &&
+                sourceMatchColumn &&
+                sourceMatchProperty &&
+                targetObjectTypeId &&
+                targetMatchColumn &&
+                targetMatchProperty
+              ) {
+                createEdgeTemplate.mutate();
+              }
+            }}
+            className="space-y-2"
+          >
+            <div className="flex flex-wrap gap-2">
+              <input
+                value={edgeTemplateName}
+                onChange={(e) => setEdgeTemplateName(e.target.value)}
+                placeholder="Template name"
+                className="rounded border border-slate-300 px-2 py-1 text-sm"
+              />
+              <select
+                value={edgeTemplateSourceId}
+                onChange={(e) => setEdgeTemplateSourceId(e.target.value)}
+                className="rounded border border-slate-300 px-2 py-1 text-sm"
+              >
+                <option value="">Source…</option>
+                {sourcesQuery.data?.sources.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
+              </select>
+              <select
+                value={relationshipTypeId}
+                onChange={(e) => setRelationshipTypeId(e.target.value)}
+                className="rounded border border-slate-300 px-2 py-1 text-sm"
+              >
+                <option value="">Relationship type…</option>
+                {relationshipTypesQuery.data?.relationshipTypes.map((rt) => (
+                  <option key={rt.id} value={rt.id}>
+                    {rt.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="flex flex-wrap items-center gap-2 rounded bg-slate-50 p-2">
+              <span className="text-xs font-medium text-slate-500">Source object</span>
+              <select
+                value={sourceObjectTypeId}
+                onChange={(e) => setSourceObjectTypeId(e.target.value)}
+                className="rounded border border-slate-300 px-2 py-1 text-xs"
+              >
+                <option value="">Object type…</option>
+                {objectTypesQuery.data?.objectTypes.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </select>
+              <input
+                value={sourceMatchColumn}
+                onChange={(e) => setSourceMatchColumn(e.target.value)}
+                placeholder="CSV column (e.g. from_account)"
+                className="rounded border border-slate-300 px-2 py-1 text-xs"
+              />
+              <span className="text-xs text-slate-400">matches property</span>
+              <input
+                value={sourceMatchProperty}
+                onChange={(e) => setSourceMatchProperty(e.target.value)}
+                placeholder="property (e.g. account_number)"
+                className="rounded border border-slate-300 px-2 py-1 text-xs"
+              />
+            </div>
+            <div className="flex flex-wrap items-center gap-2 rounded bg-slate-50 p-2">
+              <span className="text-xs font-medium text-slate-500">Target object</span>
+              <select
+                value={targetObjectTypeId}
+                onChange={(e) => setTargetObjectTypeId(e.target.value)}
+                className="rounded border border-slate-300 px-2 py-1 text-xs"
+              >
+                <option value="">Object type…</option>
+                {objectTypesQuery.data?.objectTypes.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </select>
+              <input
+                value={targetMatchColumn}
+                onChange={(e) => setTargetMatchColumn(e.target.value)}
+                placeholder="CSV column (e.g. to_account)"
+                className="rounded border border-slate-300 px-2 py-1 text-xs"
+              />
+              <span className="text-xs text-slate-400">matches property</span>
+              <input
+                value={targetMatchProperty}
+                onChange={(e) => setTargetMatchProperty(e.target.value)}
+                placeholder="property (e.g. account_number)"
+                className="rounded border border-slate-300 px-2 py-1 text-xs"
+              />
+            </div>
+            <div className="space-y-1">
+              <span className="text-xs font-medium text-slate-500">Edge properties (optional)</span>
+              {edgePropertyMappingRows.map(([col, prop], i) => (
+                <div key={i} className="flex gap-2">
+                  <input
+                    value={col}
+                    onChange={(e) => {
+                      const next = [...edgePropertyMappingRows];
+                      next[i] = [e.target.value, next[i][1]];
+                      setEdgePropertyMappingRows(next);
+                    }}
+                    placeholder="CSV column"
+                    className="rounded border border-slate-300 px-2 py-1 text-xs"
+                  />
+                  <span className="self-center text-xs text-slate-400">→</span>
+                  <input
+                    value={prop}
+                    onChange={(e) => {
+                      const next = [...edgePropertyMappingRows];
+                      next[i] = [next[i][0], e.target.value];
+                      setEdgePropertyMappingRows(next);
+                    }}
+                    placeholder="edge property key"
+                    className="rounded border border-slate-300 px-2 py-1 text-xs"
+                  />
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={() => setEdgePropertyMappingRows([...edgePropertyMappingRows, ["", ""]])}
+                className="text-xs text-slate-500 underline"
+              >
+                + add edge property mapping
+              </button>
+            </div>
+            <button type="submit" className="rounded bg-slate-100 px-3 py-1 text-sm hover:bg-slate-200">
+              Save edge template
             </button>
           </form>
         )}

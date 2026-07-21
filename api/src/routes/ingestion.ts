@@ -27,6 +27,17 @@ const CHUNK_SIZE = 500;
 
 type IngestionTemplate = { object_type_id: string; match_property: string; mapping: Record<string, string> };
 type IngestionSource = { name: string; default_classification: string };
+type EdgeTemplate = {
+  relationship_type_id: string;
+  source_object_type_id: string;
+  source_match_column: string;
+  source_match_property: string;
+  target_object_type_id: string;
+  target_match_column: string;
+  target_match_property: string;
+  property_mapping: Record<string, string>;
+  default_classification: string;
+};
 
 // Runs one advisory-lock-guarded critical section per ingestion run id. Two concurrent
 // attempts to process the same run — the ordinary case (this request is still legitimately
@@ -170,6 +181,107 @@ async function runIngestionChunks(
   }
 }
 
+// Edge ingestion's counterpart to runIngestionChunks. An edge row never creates an object —
+// it must match an already-existing source and target object (by a chosen property) or the
+// row quarantines, since there's nothing sensible to auto-merge for an edge the way there is
+// for a duplicate object. Shares the same chunking/checkpointing shape (and so the same resume
+// math: records_ingested + records_quarantined) so /ingestion/runs/:id/resume works identically
+// regardless of which kind of template a run used.
+async function runEdgeIngestionChunks(
+  ctx: RequestContext,
+  runId: string,
+  records: Record<string, string>[],
+  startAt: number,
+  edgeTemplate: EdgeTemplate,
+  source: IngestionSource,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  try {
+    for (let chunkStart = startAt; chunkStart < records.length; chunkStart += CHUNK_SIZE) {
+      const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, records.length);
+      await withRequestContext(ctx, async (client) => {
+        let chunkIngested = 0;
+        let chunkQuarantined = 0;
+
+        for (let i = chunkStart; i < chunkEnd; i++) {
+          const row = records[i];
+          const sourceMatchValue = row[edgeTemplate.source_match_column];
+          const targetMatchValue = row[edgeTemplate.target_match_column];
+          if (!sourceMatchValue || !targetMatchValue) {
+            await client.query(
+              `INSERT INTO ingestion_run_errors (run_id, row_number, raw_row, error_message) VALUES ($1, $2, $3::jsonb, $4)`,
+              [
+                runId,
+                i + 1,
+                JSON.stringify(row),
+                `missing value for ${!sourceMatchValue ? edgeTemplate.source_match_column : edgeTemplate.target_match_column}`,
+              ],
+            );
+            chunkQuarantined++;
+            continue;
+          }
+
+          // Matches only against canonical (non-merged) objects — the same rule object
+          // ingestion's own entity-resolution match query uses — so an edge never anchors to
+          // an object a prior merge has already superseded.
+          const { rows: sourceRows } = await client.query<{ id: string }>(
+            `SELECT id FROM objects WHERE object_type_id = $1 AND properties->>$2 = $3 AND canonical_of IS NULL LIMIT 1`,
+            [edgeTemplate.source_object_type_id, edgeTemplate.source_match_property, sourceMatchValue],
+          );
+          const { rows: targetRows } = await client.query<{ id: string }>(
+            `SELECT id FROM objects WHERE object_type_id = $1 AND properties->>$2 = $3 AND canonical_of IS NULL LIMIT 1`,
+            [edgeTemplate.target_object_type_id, edgeTemplate.target_match_property, targetMatchValue],
+          );
+
+          if (sourceRows.length === 0 || targetRows.length === 0) {
+            const reason =
+              sourceRows.length === 0 && targetRows.length === 0
+                ? `no matching source object for "${sourceMatchValue}" and no matching target object for "${targetMatchValue}"`
+                : sourceRows.length === 0
+                  ? `no matching source object for "${sourceMatchValue}"`
+                  : `no matching target object for "${targetMatchValue}"`;
+            await client.query(
+              `INSERT INTO ingestion_run_errors (run_id, row_number, raw_row, error_message) VALUES ($1, $2, $3::jsonb, $4)`,
+              [runId, i + 1, JSON.stringify(row), reason],
+            );
+            chunkQuarantined++;
+            continue;
+          }
+
+          const properties: Record<string, string> = {};
+          for (const [csvColumn, propertyKey] of Object.entries(edgeTemplate.property_mapping)) {
+            if (row[csvColumn] !== undefined && row[csvColumn] !== "") properties[propertyKey] = row[csvColumn];
+          }
+
+          await client.query(
+            `INSERT INTO edges (source_object_id, target_object_id, relationship_type_id, properties, classification, source)
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6)`,
+            [
+              sourceRows[0].id,
+              targetRows[0].id,
+              edgeTemplate.relationship_type_id,
+              JSON.stringify(properties),
+              edgeTemplate.default_classification,
+              source.name,
+            ],
+          );
+          chunkIngested++;
+        }
+
+        await client.query(
+          `UPDATE ingestion_runs SET records_ingested = records_ingested + $1, records_quarantined = records_quarantined + $2 WHERE id = $3`,
+          [chunkIngested, chunkQuarantined, runId],
+        );
+      });
+    }
+    return { ok: true };
+  } catch (err) {
+    await withRequestContext(ctx, async (client) => {
+      await client.query(`UPDATE ingestion_runs SET status = 'failed', completed_at = now() WHERE id = $1`, [runId]);
+    }).catch(() => {});
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 async function finalizeRun(ctx: RequestContext, runId: string, filename: string) {
   return withRequestContext(ctx, async (client) => {
     const { rows } = await client.query(`SELECT * FROM ingestion_runs WHERE id = $1`, [runId]);
@@ -278,14 +390,99 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
     reply.code(201).send(template);
   });
 
+  // Edge-mapping templates: the counterpart to /ingestion/templates for ingesting a CSV as
+  // edges between existing objects (e.g. a transactions file) instead of new objects. See
+  // DECISIONS.md #16 and migration 013.
+  app.get("/ingestion/edge-templates", async (request, reply) => {
+    if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
+    const { sourceId } = request.query as { sourceId?: string };
+    const templates = await withRequestContext(request.ctx, async (client) => {
+      const { rows } = sourceId
+        ? await client.query(`SELECT * FROM edge_mapping_templates WHERE source_id = $1 ORDER BY name`, [sourceId])
+        : await client.query(`SELECT * FROM edge_mapping_templates ORDER BY name`);
+      return rows;
+    });
+    reply.send({ templates });
+  });
+
+  app.post("/ingestion/edge-templates", async (request, reply) => {
+    if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
+    if (request.ctx.actorRole !== "admin") return reply.code(403).send({ error: "only admins can create edge mapping templates" });
+    const body = request.body as {
+      sourceId?: string;
+      name?: string;
+      relationshipTypeId?: string;
+      sourceObjectTypeId?: string;
+      sourceMatchColumn?: string;
+      sourceMatchProperty?: string;
+      targetObjectTypeId?: string;
+      targetMatchColumn?: string;
+      targetMatchProperty?: string;
+      propertyMapping?: Record<string, string>;
+      defaultClassification?: string;
+    };
+    if (
+      !body.sourceId ||
+      !body.name ||
+      !body.relationshipTypeId ||
+      !body.sourceObjectTypeId ||
+      !body.sourceMatchColumn ||
+      !body.sourceMatchProperty ||
+      !body.targetObjectTypeId ||
+      !body.targetMatchColumn ||
+      !body.targetMatchProperty
+    ) {
+      return reply.code(400).send({
+        error:
+          "sourceId, name, relationshipTypeId, sourceObjectTypeId, sourceMatchColumn, sourceMatchProperty, targetObjectTypeId, targetMatchColumn, and targetMatchProperty are required",
+      });
+    }
+
+    const template = await withRequestContext(request.ctx, async (client) => {
+      const id = randomUUID();
+      await client.query(
+        `INSERT INTO edge_mapping_templates
+           (id, source_id, name, relationship_type_id, source_object_type_id, source_match_column, source_match_property,
+            target_object_type_id, target_match_column, target_match_property, property_mapping, default_classification, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13)`,
+        [
+          id,
+          body.sourceId,
+          body.name,
+          body.relationshipTypeId,
+          body.sourceObjectTypeId,
+          body.sourceMatchColumn,
+          body.sourceMatchProperty,
+          body.targetObjectTypeId,
+          body.targetMatchColumn,
+          body.targetMatchProperty,
+          JSON.stringify(body.propertyMapping ?? {}),
+          body.defaultClassification ?? "INTERNAL",
+          request.ctx!.userId,
+        ],
+      );
+      const { rows } = await client.query(`SELECT * FROM edge_mapping_templates WHERE id = $1`, [id]);
+      await writeAudit(client, {
+        userId: request.ctx!.userId,
+        action: "ingestion.edge_template.create",
+        resourceType: "edge_mapping_template",
+        resourceId: id,
+        purpose: "new edge mapping template configured",
+      });
+      return rows[0];
+    });
+    reply.code(201).send(template);
+  });
+
   app.get("/ingestion/runs", async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
     const runs = await withRequestContext(request.ctx, async (client) => {
       const { rows } = await client.query(
-        `SELECT r.*, s.name AS source_name, t.name AS template_name
+        `SELECT r.*, s.name AS source_name, COALESCE(t.name, et.name) AS template_name
          FROM ingestion_runs r
          JOIN ingestion_sources s ON s.id = r.source_id
-         JOIN column_mapping_templates t ON t.id = r.template_id
+         LEFT JOIN column_mapping_templates t ON t.id = r.template_id
+         LEFT JOIN edge_mapping_templates et ON et.id = r.edge_template_id
          ORDER BY r.started_at DESC LIMIT 100`,
       );
       return rows;
@@ -326,7 +523,10 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
     if (!filePart) return reply.code(400).send({ error: "a CSV file is required" });
     const sourceId = (filePart.fields.sourceId as { value?: string } | undefined)?.value;
     const templateId = (filePart.fields.templateId as { value?: string } | undefined)?.value;
-    if (!sourceId || !templateId) return reply.code(400).send({ error: "sourceId and templateId fields are required" });
+    const edgeTemplateId = (filePart.fields.edgeTemplateId as { value?: string } | undefined)?.value;
+    if (!sourceId || (!templateId && !edgeTemplateId) || (templateId && edgeTemplateId)) {
+      return reply.code(400).send({ error: "sourceId and exactly one of templateId or edgeTemplateId are required" });
+    }
 
     const buffer = await filePart.toBuffer();
     let records: Record<string, string>[];
@@ -336,6 +536,38 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(400).send({ error: `could not parse CSV: ${err instanceof Error ? err.message : String(err)}` });
     }
     const fileHash = createHash("sha256").update(buffer).digest("hex");
+    const filename = filePart.filename ?? "upload.csv";
+
+    if (edgeTemplateId) {
+      const setup = await withRequestContext(request.ctx, async (client) => {
+        const { rows: sourceRows } = await client.query(`SELECT * FROM ingestion_sources WHERE id = $1`, [sourceId]);
+        const { rows: templateRows } = await client.query(`SELECT * FROM edge_mapping_templates WHERE id = $1`, [edgeTemplateId]);
+        if (sourceRows.length === 0 || templateRows.length === 0) return { error: "unknown source or edge template" as const };
+
+        const runId = randomUUID();
+        await client.query(
+          `INSERT INTO ingestion_runs (id, source_id, edge_template_id, filename, status, records_total, started_by, file_hash)
+           VALUES ($1, $2, $3, $4, 'running', $5, $6, $7)`,
+          [runId, sourceId, edgeTemplateId, filename, records.length, request.ctx!.userId, fileHash],
+        );
+        return { source: sourceRows[0], edgeTemplate: templateRows[0], runId };
+      });
+
+      if ("error" in setup) return reply.code(400).send({ error: setup.error });
+      const { source, edgeTemplate, runId } = setup;
+
+      const chunkResult = await withRunLock(runId, () =>
+        runEdgeIngestionChunks(request.ctx!, runId, records, 0, edgeTemplate as EdgeTemplate, source),
+      );
+      if (!chunkResult.locked) {
+        return reply.code(409).send({ error: "could not acquire processing lock for this run" });
+      }
+      if (!chunkResult.result.ok) {
+        return reply.code(500).send({ error: `ingestion run failed partway through: ${chunkResult.result.error}` });
+      }
+      const finalRun = await finalizeRun(request.ctx, runId, filename);
+      return reply.code(201).send(finalRun);
+    }
 
     const setup = await withRequestContext(request.ctx, async (client) => {
       const { rows: sourceRows } = await client.query(`SELECT * FROM ingestion_sources WHERE id = $1`, [sourceId]);
@@ -351,7 +583,7 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
       await client.query(
         `INSERT INTO ingestion_runs (id, source_id, template_id, filename, status, records_total, started_by, file_hash)
          VALUES ($1, $2, $3, $4, 'running', $5, $6, $7)`,
-        [runId, sourceId, templateId, filePart.filename ?? "upload.csv", records.length, request.ctx!.userId, fileHash],
+        [runId, sourceId, templateId, filename, records.length, request.ctx!.userId, fileHash],
       );
 
       return { source, template, objectType, runId };
@@ -375,7 +607,7 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
       return reply.code(500).send({ error: `ingestion run failed partway through: ${chunkResult.result.error}` });
     }
 
-    const finalRun = await finalizeRun(request.ctx, runId, filePart.filename ?? "upload.csv");
+    const finalRun = await finalizeRun(request.ctx, runId, filename);
     reply.code(201).send(finalRun);
   });
 
@@ -406,10 +638,12 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
     }
     const fileHash = createHash("sha256").update(buffer).digest("hex");
 
-    const setup = await withRequestContext(request.ctx, async (client): Promise<
+    type ResumeSetup =
       | { error: string; status: number }
-      | { run: Record<string, any>; source: IngestionSource; template: IngestionTemplate; objectType: { property_schema: PropertySchema }; startAt: number }
-    > => {
+      | { kind: "object"; run: Record<string, any>; source: IngestionSource; template: IngestionTemplate; objectType: { property_schema: PropertySchema }; startAt: number }
+      | { kind: "edge"; run: Record<string, any>; source: IngestionSource; edgeTemplate: EdgeTemplate; startAt: number };
+
+    const setup = await withRequestContext(request.ctx, async (client): Promise<ResumeSetup> => {
       const { rows: runRows } = await client.query(`SELECT * FROM ingestion_runs WHERE id = $1`, [runId]);
       if (runRows.length === 0) return { error: "not found", status: 404 };
       const run = runRows[0];
@@ -426,24 +660,25 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
         };
       }
 
-      const { rows: templateRows } = await client.query(`SELECT * FROM column_mapping_templates WHERE id = $1`, [run.template_id]);
       const { rows: sourceRows } = await client.query(`SELECT * FROM ingestion_sources WHERE id = $1`, [run.source_id]);
-      const { rows: typeRows } = await client.query(`SELECT * FROM object_types WHERE id = $1`, [templateRows[0].object_type_id]);
-
-      if (run.status === "failed") {
-        await client.query(`UPDATE ingestion_runs SET status = 'running' WHERE id = $1`, [runId]);
-      }
       const startAt = run.records_ingested + run.records_quarantined;
-      return { run, source: sourceRows[0], template: templateRows[0], objectType: typeRows[0], startAt };
+
+      if (run.edge_template_id) {
+        const { rows: edgeTemplateRows } = await client.query(`SELECT * FROM edge_mapping_templates WHERE id = $1`, [run.edge_template_id]);
+        if (run.status === "failed") await client.query(`UPDATE ingestion_runs SET status = 'running' WHERE id = $1`, [runId]);
+        return { kind: "edge", run, source: sourceRows[0], edgeTemplate: edgeTemplateRows[0] as EdgeTemplate, startAt };
+      }
+
+      const { rows: templateRows } = await client.query(`SELECT * FROM column_mapping_templates WHERE id = $1`, [run.template_id]);
+      const { rows: typeRows } = await client.query(`SELECT * FROM object_types WHERE id = $1`, [templateRows[0].object_type_id]);
+      if (run.status === "failed") await client.query(`UPDATE ingestion_runs SET status = 'running' WHERE id = $1`, [runId]);
+      return { kind: "object", run, source: sourceRows[0], template: templateRows[0], objectType: typeRows[0], startAt };
     });
 
     if ("error" in setup) return reply.code(setup.status).send({ error: setup.error });
-    const { run, source, template, objectType, startAt } = setup;
-    const schema = objectType.property_schema as PropertySchema;
-    const mapping = template.mapping as Record<string, string>;
-    const filename: string = run.filename;
+    const filename: string = setup.run.filename;
 
-    if (startAt >= records.length) {
+    if (setup.startAt >= records.length) {
       // A prior attempt finished every chunk but crashed before its final status update — no
       // rows left to process, just finalize.
       const finalRun = await finalizeRun(request.ctx, runId, filename);
@@ -451,7 +686,18 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const chunkResult = await withRunLock(runId, () =>
-      runIngestionChunks(request.ctx!, runId, records, startAt, schema, mapping, template, source),
+      setup.kind === "edge"
+        ? runEdgeIngestionChunks(request.ctx!, runId, records, setup.startAt, setup.edgeTemplate, setup.source)
+        : runIngestionChunks(
+            request.ctx!,
+            runId,
+            records,
+            setup.startAt,
+            setup.objectType.property_schema as PropertySchema,
+            setup.template.mapping as Record<string, string>,
+            setup.template,
+            setup.source,
+          ),
     );
     if (!chunkResult.locked) {
       return reply.code(409).send({ error: "this run is currently being processed (already resuming, or the original request is still running) — try again shortly" });
