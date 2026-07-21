@@ -321,6 +321,12 @@ short version:
 - **Keycloak client split**: the browser client (`platform-api`) no longer allows the
   password-grant flow the backend test scripts used; a separate `platform-test` client handles
   that now. Closes the item `SECURITY_GAP_ASSESSMENT.md` named as top-priority.
+- **Ingestion processing moved off the request/response cycle**: chunking (above) made a large
+  run crash-safe, but a real 20,000-row upload still held one HTTP request open for its full
+  82s. `POST /ingestion/runs`/`resume` now return as soon as the run is created, processing
+  continues in the background, and the intake UI polls for status. Verified against a real
+  20k-row run: the request returned in ~70ms, and concurrent requests stayed fast (2-20ms)
+  throughout processing instead of contending for a starved pool.
 
 An "AI Project Improvements & Persistent Memory System" proposal (multi-agent decision
 personas, a knowledge-graph world model, confidence/scenario engines, an autonomous
@@ -349,4 +355,6 @@ why it was made.
 What's left before a design-partner pilot: retention enforcement, DPIA/records-of-processing
 tooling, and a backend-for-frontend to move browser tokens out of `sessionStorage` into an
 httpOnly cookie (`DECISIONS.md` #11) — plus an actual cloud deployment to an EU host, none of
-which exist yet because there's no shared environment to deploy to.
+which exist yet because there's no shared environment to deploy to. `docs/PLAN.md` phases the
+remaining PRD v1.1 items (retention enforcement, XLSX ingestion, API type safety, deployment,
+backup/restore); the BFF/token item isn't yet in that plan.

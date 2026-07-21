@@ -552,3 +552,35 @@ classification, and 1 quarantined row with a precise "no matching target object"
 crashed a real 3,000-row edge-ingestion run at 1,000 rows and resumed it with the same file:
 completed at exactly 3,000 total edges, confirmed zero duplicates by direct count.
 **Source:** `db/migrations/013_edge_mapping_templates.sql`, `api/src/routes/ingestion.ts`
+
+### #46 — Ingestion processing moved off the request/response cycle (PRD v1.1 B6)
+
+**Choice:** `POST /ingestion/runs` (both create paths) and `POST /ingestion/runs/:id/resume` now
+return `202` with the freshly created/resumed run (status `running`, counters at their starting
+values) as soon as the run row exists, instead of awaiting `runIngestionChunks`/
+`runEdgeIngestionChunks` to completion first. The actual chunk processing — unchanged from
+#37/#38 — runs after the response is sent; its outcome (including marking the run `failed`) is
+handled entirely inside that detached execution, since nothing is listening on an HTTP response
+by the time it finishes. `web/src/IntakePage.tsx`'s runs list now polls every 2s while any run is
+`pending`/`running`, since the upload response itself no longer carries final counts.
+
+**Reason:** #37 made a large run resumable and crash-safe, but never addressed the PRD's actual
+complaint: a real 20,000-row run still held one HTTP request (and, transitively, the client's
+connection) open for however long the whole file took — 82s in #37's own measurement, worse for
+a partner-sized 50k-row file. Chunking already released the *processing* connection between
+chunks; the request/response lifecycle was the one piece still coupled to total run duration.
+
+**Design note:** the per-run advisory lock (#38) had to be split into an explicit
+acquire/release (`tryAcquireRunLock`) rather than the previous single `withRunLock(id, fn)`
+helper that acquired, ran, and released as one unit. A real concurrent second attempt at the same
+run must still get an immediate `409` — verified behavior worth keeping — which requires
+learning synchronously whether the lock was won, before deciding to hand off the rest to the
+background.
+
+**Verified** against a real 20,000-row upload over HTTP: the request returned in ~70ms (`202`,
+`records_ingested: 0`) instead of blocking; concurrent `GET /ingestion/runs` and `GET /objects`
+calls issued while that run was actively processing completed in 2-20ms throughout, confirming
+the connection pool wasn't starved; a second, independent run started and ran to `completed`
+while the first was still mid-flight; the web UI reflected both runs' progress live via polling
+with no manual refresh, matching what a browser session would actually observe during a pilot.
+**Source:** `api/src/routes/ingestion.ts`, `web/src/IntakePage.tsx`
