@@ -16,5 +16,17 @@ services:
       timeout: 3s
       retries: 10
 
+  keycloak:
+    image: quay.io/keycloak/keycloak:25.0
+    container_name: platform_keycloak
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin_local_dev_only
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+
 volumes:
   pgdata:
