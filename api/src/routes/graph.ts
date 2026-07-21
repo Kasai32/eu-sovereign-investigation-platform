@@ -7,6 +7,13 @@ import { writeAudit } from "../audit.js";
 // the client an unbounded subgraph to begin with regardless of what the UI does with it.
 const MAX_NODES = 500;
 
+// Caps how many edges are followed out of any single node per recursion step. Without this,
+// the recursive CTE's only limits were depth (hops) and a final LIMIT applied after the full
+// expansion materialized — a hub entity (e.g. a shared address linked to thousands of accounts,
+// a realistic fraud-ring pattern) could force Postgres to build a combinatorially large
+// intermediate result before that final LIMIT ever took effect.
+const MAX_FANOUT_PER_NODE = 50;
+
 const graphRoutes: FastifyPluginAsync = async (app) => {
   app.get("/graph/expand", async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
@@ -22,14 +29,18 @@ const graphRoutes: FastifyPluginAsync = async (app) => {
         `WITH RECURSIVE expansion(object_id, depth) AS (
            SELECT $1::uuid, 0
            UNION
-           SELECT CASE WHEN e.source_object_id = ex.object_id THEN e.target_object_id ELSE e.source_object_id END,
-                  ex.depth + 1
-           FROM edges e
-           JOIN expansion ex ON e.source_object_id = ex.object_id OR e.target_object_id = ex.object_id
+           SELECT nxt.neighbor_id, ex.depth + 1
+           FROM expansion ex
+           CROSS JOIN LATERAL (
+             SELECT CASE WHEN e.source_object_id = ex.object_id THEN e.target_object_id ELSE e.source_object_id END AS neighbor_id
+             FROM edges e
+             WHERE e.source_object_id = ex.object_id OR e.target_object_id = ex.object_id
+             LIMIT $4
+           ) nxt
            WHERE ex.depth < $2
          )
          SELECT object_id, min(depth) AS depth FROM expansion GROUP BY object_id ORDER BY depth LIMIT $3`,
-        [q.nodeId, hops, MAX_NODES + 1],
+        [q.nodeId, hops, MAX_NODES + 1, MAX_FANOUT_PER_NODE],
       );
 
       const truncated = nodeRows.length > MAX_NODES;

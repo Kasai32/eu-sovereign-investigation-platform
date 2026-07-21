@@ -14,9 +14,12 @@ const objectsRoutes: FastifyPluginAsync = async (app) => {
     const purpose = q.purpose ?? "routine investigation browse";
 
     const objects = await withRequestContext(request.ctx, async (client) => {
+      // `%` (not a bare similarity() comparison) is required for the query planner to use
+      // idx_objects_name_trgm at all — see the matching fix in ingestion.ts for why.
+      if (q.q) await client.query(`SET LOCAL pg_trgm.similarity_threshold = 0.2`);
       const filter = new ClauseBuilder()
         .add("ot.name", q.type)
-        .addRaw((i) => `similarity(o.properties->>'name', $${i}) > 0.2`, q.q);
+        .addRaw((i) => `(o.properties->>'name') % $${i}`, q.q);
       const limitIdx = filter.param(limit);
       const offsetIdx = filter.param(offset);
       const { rows } = await client.query(

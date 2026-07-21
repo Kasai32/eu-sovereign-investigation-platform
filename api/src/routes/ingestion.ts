@@ -217,10 +217,17 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
 
         const matchValue = properties[template.match_property];
         if (matchValue) {
+          // Postgres can only use pg_trgm's GIN index via the `%`/`<->` operators, never via a
+          // bare `similarity()` call in ORDER BY — the prior version of this query scored every
+          // row of the object type on every ingested row regardless of index. Setting the
+          // threshold and filtering with `%` lets the index (when match_property is "name", the
+          // one property it currently covers) prune candidates before the exact score is computed.
+          await client.query(`SET LOCAL pg_trgm.similarity_threshold = ${AMBIGUOUS_FLOOR}`);
           const { rows: matches } = await client.query(
             `SELECT id, similarity(properties->>$1, $2) AS sim
              FROM objects
-             WHERE object_type_id = $3 AND id <> $4 AND canonical_of IS NULL AND properties->>$1 IS NOT NULL
+             WHERE object_type_id = $3 AND id <> $4 AND canonical_of IS NULL
+               AND (properties->>$1) % $2
              ORDER BY sim DESC LIMIT 1`,
             [template.match_property, matchValue, template.object_type_id, objectId],
           );

@@ -33,11 +33,23 @@ const adminRoutes: FastifyPluginAsync = async (app) => {
     if (body.clearance && !CLEARANCES.includes(body.clearance)) {
       return reply.code(400).send({ error: `clearance must be one of ${CLEARANCES.join(", ")}` });
     }
+    // Every other sensitive-access route in this API requires an explicit purpose rather than
+    // defaulting one; granting RESTRICTED clearance is at least as sensitive as reading a
+    // RESTRICTED object, so this route shouldn't be the one exception.
+    if (!body.purpose) return reply.code(400).send({ error: "purpose is required to change a user's role/clearance/active state" });
+    const purpose = body.purpose;
 
     const result = await withRequestContext(request.ctx, async (client) => {
       const set = new ClauseBuilder().add("role", body.role).add("clearance", body.clearance).add("is_active", body.isActive);
       if (set.isEmpty) return { error: "nothing to update" as const };
       const idIdx = set.param(id);
+
+      const { rows: beforeRows } = await client.query(
+        `SELECT role, clearance, is_active FROM app_users WHERE id = $1`,
+        [id],
+      );
+      if (beforeRows.length === 0) return null;
+      const before = beforeRows[0];
 
       await client.query(`UPDATE app_users SET ${set.set()} WHERE id = $${idIdx}`, set.values);
       const { rows } = await client.query(
@@ -51,8 +63,11 @@ const adminRoutes: FastifyPluginAsync = async (app) => {
         action: "admin.user.update",
         resourceType: "app_user",
         resourceId: id,
-        purpose: body.purpose ?? "user role/clearance updated by administrator",
-        details: { role: body.role, clearance: body.clearance, isActive: body.isActive },
+        purpose,
+        details: {
+          previous: { role: before.role, clearance: before.clearance, isActive: before.is_active },
+          updated: { role: body.role, clearance: body.clearance, isActive: body.isActive },
+        },
       });
 
       return { user: rows[0] };

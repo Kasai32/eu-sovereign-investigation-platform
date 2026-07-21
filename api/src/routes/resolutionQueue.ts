@@ -111,7 +111,17 @@ const resolutionQueueRoutes: FastifyPluginAsync = async (app) => {
       const pair = rows[0];
 
       if (decision === "merged") {
-        await client.query(`UPDATE objects SET canonical_of = $1 WHERE id = $2`, [pair.object_a_id, pair.object_b_id]);
+        // RLS enforces WITH CHECK (classification <= clearance) on this UPDATE by silently
+        // matching zero rows, not by raising an error. Without this check, an under-cleared
+        // reviewer's merge would report success (and write an audit row saying so) while
+        // objects.canonical_of was never actually set.
+        const mergeResult = await client.query(
+          `UPDATE objects SET canonical_of = $1 WHERE id = $2`,
+          [pair.object_a_id, pair.object_b_id],
+        );
+        if (mergeResult.rowCount === 0) {
+          return { error: "merge blocked: session clearance is insufficient to modify one or both objects" as const };
+        }
       }
       await client.query(
         `UPDATE resolution_queue SET decision = $1, decided_by = $2, decided_at = now() WHERE id = $3`,
@@ -131,6 +141,7 @@ const resolutionQueueRoutes: FastifyPluginAsync = async (app) => {
     });
 
     if (!result) return reply.code(404).send({ error: "not found" });
+    if ("error" in result) return reply.code(403).send({ error: result.error });
     reply.send(result);
   });
 

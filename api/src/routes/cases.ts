@@ -5,6 +5,11 @@ import { writeAudit } from "../audit.js";
 import { ClauseBuilder } from "../lib/clauseBuilder.js";
 
 const STATUSES = ["open", "under_review", "closed", "archived"] as const;
+// A closed case freezes an evidence_snapshot for reporting, but that alone doesn't stop the
+// live case record itself from being edited afterward — notes, pins, and unpins had no status
+// check at all. Left unguarded, an auditor reading the case detail view could see edits made
+// after "closing" that the frozen report never reflects.
+const LOCKED_STATUSES = new Set(["closed", "archived"]);
 
 const casesRoutes: FastifyPluginAsync = async (app) => {
   // S1: case queue.
@@ -134,7 +139,13 @@ const casesRoutes: FastifyPluginAsync = async (app) => {
     const { body: noteBody, purpose } = request.body as { body?: string; purpose?: string };
     if (!noteBody) return reply.code(400).send({ error: "body is required" });
 
-    const note = await withRequestContext(request.ctx, async (client) => {
+    const result = await withRequestContext(request.ctx, async (client) => {
+      const { rows: caseRows } = await client.query(`SELECT status FROM cases WHERE id = $1`, [id]);
+      if (caseRows.length === 0) return null;
+      if (LOCKED_STATUSES.has(caseRows[0].status)) {
+        return { error: `case is ${caseRows[0].status} and cannot be modified` as const };
+      }
+
       // Same RETURNING-vs-case_visible() limitation as case creation — see the comment there.
       const noteId = randomUUID();
       await client.query(
@@ -156,10 +167,12 @@ const casesRoutes: FastifyPluginAsync = async (app) => {
         resourceId: id,
         purpose: purpose ?? "investigation note added",
       });
-      return rows[0];
+      return { note: rows[0] };
     });
 
-    reply.code(201).send(note);
+    if (!result) return reply.code(404).send({ error: "not found" });
+    if ("error" in result) return reply.code(409).send({ error: result.error });
+    reply.code(201).send(result.note);
   });
 
   // Seeds the S2 graph canvas: the case's pinned entities as nodes, plus edges among just
@@ -210,7 +223,13 @@ const casesRoutes: FastifyPluginAsync = async (app) => {
     const { objectId, purpose } = request.body as { objectId?: string; purpose?: string };
     if (!objectId) return reply.code(400).send({ error: "objectId is required" });
 
-    await withRequestContext(request.ctx, async (client) => {
+    const result = await withRequestContext(request.ctx, async (client) => {
+      const { rows: caseRows } = await client.query(`SELECT status FROM cases WHERE id = $1`, [id]);
+      if (caseRows.length === 0) return null;
+      if (LOCKED_STATUSES.has(caseRows[0].status)) {
+        return { error: `case is ${caseRows[0].status} and cannot be modified` as const };
+      }
+
       await client.query(
         `INSERT INTO case_entities (case_id, object_id, pinned_by) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
         [id, objectId, request.ctx!.userId],
@@ -227,9 +246,12 @@ const casesRoutes: FastifyPluginAsync = async (app) => {
         purpose: purpose ?? "entity pinned to case",
         details: { objectId },
       });
+      return { ok: true as const };
     });
 
-    reply.send({ ok: true });
+    if (!result) return reply.code(404).send({ error: "not found" });
+    if ("error" in result) return reply.code(409).send({ error: result.error });
+    reply.send(result);
   });
 
   app.delete("/cases/:id/entities/:objectId", async (request, reply) => {
@@ -237,7 +259,13 @@ const casesRoutes: FastifyPluginAsync = async (app) => {
     const { id, objectId } = request.params as { id: string; objectId: string };
     const { purpose } = (request.query as { purpose?: string }) ?? {};
 
-    await withRequestContext(request.ctx, async (client) => {
+    const result = await withRequestContext(request.ctx, async (client) => {
+      const { rows: caseRows } = await client.query(`SELECT status FROM cases WHERE id = $1`, [id]);
+      if (caseRows.length === 0) return null;
+      if (LOCKED_STATUSES.has(caseRows[0].status)) {
+        return { error: `case is ${caseRows[0].status} and cannot be modified` as const };
+      }
+
       await client.query(`DELETE FROM case_entities WHERE case_id = $1 AND object_id = $2`, [id, objectId]);
       await client.query(
         `INSERT INTO case_activity (case_id, actor_id, action, details) VALUES ($1, $2, 'entity_unpinned', $3::jsonb)`,
@@ -251,9 +279,12 @@ const casesRoutes: FastifyPluginAsync = async (app) => {
         purpose: purpose ?? "entity removed from case",
         details: { objectId },
       });
+      return { ok: true as const };
     });
 
-    reply.send({ ok: true });
+    if (!result) return reply.code(404).send({ error: "not found" });
+    if ("error" in result) return reply.code(409).send({ error: result.error });
+    reply.send(result);
   });
 
   // Closing freezes an evidence snapshot (the specific object/edge IDs relied on) so later
