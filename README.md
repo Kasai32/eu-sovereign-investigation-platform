@@ -256,7 +256,12 @@ Keycloak client's browser and test-script grant types), each with a rough priori
 
 Phases 0–6 (schema/RLS/audit chain, API + Keycloak auth, S1/S3/S4 frontend, S2 case workspace,
 S5/S6 intake + entity resolution, S7 admin/audit/export, hardening) are done and verified — see
-`PHASE0_REVIEW.md` through `PHASE6_REVIEW.md` and `SECURITY_GAP_ASSESSMENT.md`. This closes out
+`PHASE0_REVIEW.md` through `PHASE6_REVIEW.md` and `SECURITY_GAP_ASSESSMENT.md`. `DECISIONS.md`
+is the running architecture decision record — why each real design choice was made, what
+alternatives were rejected and why, and which earlier decisions were later superseded (e.g. the
+original synchronous single-transaction ingestion, later replaced by chunking + resumability).
+Check it before re-litigating something already decided or reversing a decision without knowing
+why it was made. This closes out
 the blueprint's originally-scoped v1 screen list plus the strategy document's pre-pilot
 hardening checklist. What's left before a design-partner pilot is the items named in the gap
 assessment's priority list — CI automation, retention enforcement, DPIA/records-of-processing
