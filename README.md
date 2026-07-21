@@ -15,19 +15,25 @@ deferred.
 
 ## What's here
 
-Phase 0 only: ontology schema, RLS enforced via a dedicated non-superuser `app_user` role,
-hash-chained audit log, synthetic AML seed data, and two verification scripts that prove (not
-assert) the security properties hold.
+The foundation, shipped in Phase 0 and unchanged in substance since: ontology schema, RLS
+enforced via a dedicated non-superuser `app_user` role, hash-chained audit log, synthetic AML
+seed data, and verification scripts that prove (not assert) the security properties hold.
+Everything built on top of it — the full API, frontend, and all seven v1 screens — is in the
+phase sections below; see "Beyond Phase 6" for what's happened since the v1 build closed out.
 
 ```
 db/
-  migrations/   001-005, applied in order, DDL-only (run as postgres superuser)
+  migrations/   all files, applied in order, DDL-only (run as postgres superuser)
   seed/         synthetic fin-crime entities/edges/case (SYNTHETIC DATA ONLY)
+  loadtest/     synthetic data generator + benchmark queries for validating performance at the
+                blueprint's stated scale target (1M objects/5M edges) — see "Beyond Phase 6" below
   scripts/
-    migrate.sh          apply all migrations
-    seed.sh             load synthetic seed data
-    test-rls.sh          proves RLS with real low- vs high-clearance query diffs
-    test-audit-chain.sh proves the hash chain detects tampering
+    migrate.sh              apply all migrations
+    seed.sh                 load synthetic seed data
+    test-rls.sh              proves RLS with real low- vs high-clearance query diffs
+    test-audit-chain.sh     proves the hash chain detects tampering
+    loadtest-generate.sh    generate synthetic data at scale (default 1M objects/5M edges)
+    loadtest-cleanup.sh     remove everything loadtest-generate.sh created
 ```
 
 ## Running it
@@ -76,9 +82,11 @@ api/
     audit.ts           writeAudit() wrapper around write_audit_log()
     routes/
       objects.ts        S3/S4 — search + entity detail
-      graph.ts           server-side k-hop expansion (recursive CTE, capped)
-      cases.ts            S1/S2 — queue, workspace, notes, pin, status (with evidence snapshot
-                          on close)
+      graph.ts           server-side k-hop expansion (recursive CTE, per-node fan-out capped)
+                          + shortest-path (app-level BFS — see "Beyond Phase 6" below)
+      cases/              S1/S2 — queue, workspace, notes, pin, status (with evidence snapshot
+                          on close); split into queue.ts/workspace.ts/lifecycle.ts + shared.ts,
+                          composed by index.ts — see "Beyond Phase 6" below
       audit.ts           S7 — compliance/admin-only audit log + chain verification
   scripts/
     test-rls-http.sh    proves RLS through the full HTTP stack with real Keycloak tokens
@@ -115,7 +123,10 @@ web/
       pkce.ts           code_verifier/code_challenge generation (Web Crypto, no dependency)
       auth.ts            PKCE login/callback/refresh/logout against Keycloak
       AuthContext.tsx     React context: tokens, silent refresh, decoded display claims
-      api.ts              typed fetch client (objects/cases), auto-attaches a valid access token
+      api/                typed fetch client, auto-attaches a valid access token; one file per
+                          domain (objects/cases/graph/ingestion/resolutionQueue/admin/audit)
+                          composed into one flat useApiClient() by index.ts — see "Beyond
+                          Phase 6" below
     router.tsx           root layout + all routes/screens (Search, Object detail, Cases)
 ```
 
@@ -150,8 +161,9 @@ web/src/
   CaseWorkspacePage.test.tsx  cross-pane linked-selection integration test (Vitest + RTL)
   components/GraphCanvas.tsx  Cytoscape wrapper: props -> cy instance sync via effects
 api/src/routes/
-  cases.ts   + GET /cases/:id/graph, DELETE /cases/:id/entities/:objectId
-  graph.ts   + GET /graph/path (server-side shortest path, recursive CTE)
+  cases/     + GET /cases/:id/graph, DELETE /cases/:id/entities/:objectId
+  graph.ts   + GET /graph/path (server-side shortest path; originally a recursive CTE, later
+             rewritten as an app-level BFS — see "Beyond Phase 6" below)
 ```
 
 ### Running Phase 3
@@ -219,7 +231,7 @@ others share it, since they only gate loading after a one-time submission, not l
 api/src/routes/
   admin.ts       GET/PATCH /admin/users, admin-only, audited
   audit.ts       + date-range/resource-type filters, user display names
-  cases.ts       + GET /cases/:id/report (evidence-snapshot-aware), status-close snapshot now
+  cases/         + GET /cases/:id/report (evidence-snapshot-aware), status-close snapshot now
                  embeds full object/edge data, not just IDs
 web/src/
   AdminUsersPage.tsx   S7 user administration
@@ -234,8 +246,9 @@ for compliance/admin roles). Export a report from any case workspace's "Export r
 
 ## Phase 6: hardening
 
-Rate limiting (`@fastify/rate-limit`, 300 req/min global default, `/health` exempted), security
-headers (`@fastify/helmet`), a request body-size cap set safely above the multipart upload
+Rate limiting (`@fastify/rate-limit`, 300 req/min global default, `/health` exempted; the two
+most expensive routes were later given tighter per-route limits — see "Beyond Phase 6" below),
+security headers (`@fastify/helmet`), a request body-size cap set safely above the multipart upload
 limit, and a CORS origin allowlist that reads a comma-separated list from config instead of one
 hardcoded default. Also: Postgres/Keycloak admin passwords and `app_user`'s password are now
 configurable via `.env` (copy `.env.example`) instead of hardcoded-only — verified with an
@@ -249,21 +262,91 @@ every change in this phase.
 
 `SECURITY_GAP_ASSESSMENT.md` is a code-level pass against ISO/IEC 27001:2022 Annex A — not a
 certification audit, but an honest baseline naming what's covered, what's partial, and what's a
-real gap (retention enforcement, CI automation, DPIA tooling, monitoring/alerting, splitting the
-Keycloak client's browser and test-script grant types), each with a rough priority.
+real gap, each with a rough priority. Two of its named gaps (CI automation, splitting the
+Keycloak client's browser and test-script grant types) were closed afterward — see "Beyond
+Phase 6" below; the document itself is left as originally written rather than edited after the
+fact, since it's meant to reflect what a point-in-time assessment actually found.
+
+## Beyond Phase 6: external review, load testing, and follow-through
+
+Phase 6 closed out the blueprint's originally-scoped v1 build. Since then, an external code
+review (not a self-review, unlike Phases 0–6) and a load test against the blueprint's own stated
+scale target (1M objects/5M edges — never actually tested until now) found and fixed several
+real issues, each verified live against real data rather than by inspection. Full detail —
+including what was tried and rejected along the way — is in `DECISIONS.md` #30–#43; this is the
+short version:
+
+- **`resolution_queue` RLS gap closed**: it didn't inherit the classification of the two
+  candidate objects it referenced (self-flagged since `PHASE0_REVIEW.md`); an under-cleared
+  reviewer could "merge" a RESTRICTED pair and have it silently no-op while the audit log
+  reported success. Fixed at both the RLS and application layers.
+- **`/graph/expand` given a per-node fan-out cap**, not just a depth cap, after confirming a hub
+  entity could otherwise force a combinatorially large intermediate result before the final
+  row limit applied.
+- **Ingestion/search trigram matching fixed to actually use its own index**: the prior queries
+  used a bare `similarity()` call, which Postgres can never accelerate via the GIN trigram index
+  regardless of query shape — confirmed via `EXPLAIN`, not assumed.
+- **Admin route hardened**: `purpose` is now required (was defaulted), and the audit entry now
+  records previous values, not just new ones.
+- **Closed/archived cases can no longer be edited** (notes, pin/unpin) — the evidence snapshot
+  froze the *report*, but nothing had stopped the live case record itself from changing after.
+- **Load-tested at 1M objects/5M edges** (`db/loadtest/`) — the first time this codebase's
+  performance was checked against the blueprint's actual stated target rather than assumed from
+  seed-scale data. This found a real bug, not just confirmed correctness:
+- **`/graph/path` rewritten as an app-level BFS.** The original recursive-CTE shortest-path query
+  (built in Phase 3, already flagged there as needing "a proper algorithm... before a denser
+  graph would make this expensive") timed out past 30s at 5M edges. A fan-out cap — the fix that
+  worked for `/graph/expand` — doesn't help here, confirmed by testing it directly: path search
+  tracks a full path array per candidate, so growth is exponential in fan-out^hops regardless of
+  the cap. The rewrite tracks only visited node IDs, bounded by an edge-examination budget; it
+  has an accepted, documented completeness limit (very distant pairs in a dense graph can report
+  "not found within budget" rather than a wrong answer or a hang) that a true bidirectional BFS
+  would close — named as a future improvement, not built.
+- **Ingestion chunked into per-500-row transactions with checkpointing**, replacing the original
+  single-transaction design (named as a scale risk since `PHASE4_REVIEW.md`). Proven necessary,
+  not theoretical: the old version took 82s for 20,000 rows over real HTTP, and killing the
+  server mid-run lost every row silently, with no record a run had even been attempted.
+- **Ingestion made resumable** (`POST /ingestion/runs/:id/resume`): a crashed or failed run can
+  be safely continued by re-uploading the same file — a SHA-256 file-hash check plus a
+  session-scoped advisory lock make this safe against a wrong file or a concurrent double-resume.
+  Verified by actually crashing a real run mid-flight and resuming it.
+- **`cases.ts` and `web/lib/api.ts` split into per-domain modules** (`api/src/routes/cases/`,
+  `web/src/lib/api/`), both previously named as split candidates but deliberately deferred until
+  the risk could be paid off with real verification. Zero behavior change — every route/call site
+  is identical; only where the code lives changed.
+- **CI pipeline stood up** (`.github/workflows/ci.yml`), running the exact same sequence a
+  developer runs locally rather than a parallel CI-only setup.
+- **Rate limiting tuned per-route** on the two most expensive endpoints (ingestion, report
+  export), instead of relying on the single global default alone.
+- **Keycloak client split**: the browser client (`platform-api`) no longer allows the
+  password-grant flow the backend test scripts used; a separate `platform-test` client handles
+  that now. Closes the item `SECURITY_GAP_ASSESSMENT.md` named as top-priority.
+
+An "AI Project Improvements & Persistent Memory System" proposal (multi-agent decision
+personas, a knowledge-graph world model, confidence/scenario engines, an autonomous
+self-modifying workflow) was evaluated and declined — its own stated mission doesn't match this
+project's actual one, and its core premise runs against this codebase's real, human-accountable
+audit design. `DECISIONS.md` itself is the one piece of that proposal judged worth keeping,
+stripped of the framing around it (`DECISIONS.md` #40).
 
 ## Status
 
 Phases 0–6 (schema/RLS/audit chain, API + Keycloak auth, S1/S3/S4 frontend, S2 case workspace,
 S5/S6 intake + entity resolution, S7 admin/audit/export, hardening) are done and verified — see
-`PHASE0_REVIEW.md` through `PHASE6_REVIEW.md` and `SECURITY_GAP_ASSESSMENT.md`. `DECISIONS.md`
-is the running architecture decision record — why each real design choice was made, what
-alternatives were rejected and why, and which earlier decisions were later superseded (e.g. the
-original synchronous single-transaction ingestion, later replaced by chunking + resumability).
-Check it before re-litigating something already decided or reversing a decision without knowing
-why it was made. This closes out
+`PHASE0_REVIEW.md` through `PHASE6_REVIEW.md` and `SECURITY_GAP_ASSESSMENT.md`. This closes out
 the blueprint's originally-scoped v1 screen list plus the strategy document's pre-pilot
-hardening checklist. What's left before a design-partner pilot is the items named in the gap
-assessment's priority list — CI automation, retention enforcement, DPIA/records-of-processing
-tooling — plus an actual cloud deployment to an EU host, none of which exist yet because there's
-no shared environment to deploy to.
+hardening checklist. Since then, see "Beyond Phase 6" above for an external review's fixes, a
+load test at the blueprint's stated scale target, and follow-through on three of the gap
+assessment's named items (CI, per-route rate limiting, the Keycloak client split).
+
+`DECISIONS.md` is the running architecture decision record — why each real design choice was
+made, what alternatives were rejected and why, and which earlier decisions were later superseded
+(e.g. the original synchronous single-transaction ingestion, later replaced by chunking +
+resumability; the original recursive-CTE shortest path, later replaced by an app-level BFS).
+Check it before re-litigating something already decided or reversing a decision without knowing
+why it was made.
+
+What's left before a design-partner pilot: retention enforcement, DPIA/records-of-processing
+tooling, and a backend-for-frontend to move browser tokens out of `sessionStorage` into an
+httpOnly cookie (`DECISIONS.md` #11) — plus an actual cloud deployment to an EU host, none of
+which exist yet because there's no shared environment to deploy to.
