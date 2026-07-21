@@ -4,12 +4,16 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "outDir": "dist",
-    "rootDir": "src",
+    // The repo root, not "src": rootDir must cover every included file, and ../shared (below)
+    // is now one of them. This only reshapes dist/'s layout for `npm run build` (dist now
+    // mirrors from the repo root instead of from src/) — neither `dev` (tsx) nor `start` (node
+    // --experimental-strip-types) reads from dist, so nothing that actually runs is affected.
+    "rootDir": "..",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src"]
+  "include": ["src", "../shared"]
 }

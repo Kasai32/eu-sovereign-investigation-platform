@@ -53,7 +53,7 @@ const fixtureCase = {
     assigned_to: null,
     created_by: "u1",
     created_at: "2026-01-01T00:00:00Z",
-    entity_count: 2,
+    updated_at: "2026-01-01T00:00:00Z",
     evidence_snapshot: null,
     closed_at: null,
   },

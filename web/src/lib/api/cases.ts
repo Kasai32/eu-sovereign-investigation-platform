@@ -1,5 +1,6 @@
-import { request, type WithToken } from "./client";
-import type { CaseDetail, CaseNote, CaseReport, CaseSummary, GraphEdge, GraphNode } from "./types";
+import { request, requestWithSchema, type WithToken } from "./client";
+import type { CaseNote, CaseReport, CaseSummary, GraphEdge, GraphNode } from "./types";
+import { caseDetailResponseSchema } from "../../../../shared/schemas/caseDetail";
 
 export function createCasesApi(withToken: WithToken) {
   return {
@@ -17,7 +18,9 @@ export function createCasesApi(withToken: WithToken) {
       ),
 
     getCase: (id: string, purpose: string) =>
-      withToken((token) => request<CaseDetail>(`/cases/${id}?purpose=${encodeURIComponent(purpose)}`, token)),
+      withToken((token) =>
+        requestWithSchema(`/cases/${id}?purpose=${encodeURIComponent(purpose)}`, token, caseDetailResponseSchema),
+      ),
 
     getCaseGraph: (id: string) =>
       withToken((token) => request<{ nodes: GraphNode[]; edges: GraphEdge[] }>(`/cases/${id}/graph`, token)),

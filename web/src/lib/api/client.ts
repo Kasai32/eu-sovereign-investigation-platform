@@ -1,3 +1,5 @@
+import type { z } from "zod";
+
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:4000";
 
 export class ApiError extends Error {
@@ -26,6 +28,21 @@ export async function request<T>(path: string, token: string, init?: RequestInit
     throw new ApiError(res.status, body.error ?? res.statusText);
   }
   return res.json() as Promise<T>;
+}
+
+// PRD v1.1 N5: request<T>() above is a bare type assertion — nothing actually checks the
+// response matches T, so a shape change on the API surfaces as a silent `undefined` at
+// whatever field moved, not a build failure. This validates against the same Zod schema the
+// API validates its own response against (shared/schemas/*.ts) instead — a mismatch throws
+// here, loudly, rather than downstream wherever the missing field happens to get read.
+export async function requestWithSchema<S extends z.ZodType>(
+  path: string,
+  token: string,
+  schema: S,
+  init?: RequestInit,
+): Promise<z.infer<S>> {
+  const json = await request<unknown>(path, token, init);
+  return schema.parse(json);
 }
 
 // Every per-domain module (objects.ts, cases.ts, ...) takes a WithToken and builds its methods

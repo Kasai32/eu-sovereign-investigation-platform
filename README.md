@@ -339,6 +339,14 @@ short version:
   elapsed, skipping anything still pinned to an open case. Verified live: restarted the server
   with a fresh expired object in place and confirmed the scheduled sweep anonymized it
   automatically within seconds, no manual trigger involved.
+- **Shared, validated request/response schema for `GET /cases/:id`** (`shared/schemas/
+  caseDetail.ts`, see `shared/README.md`): the first route migrated off the frontend's bare
+  `request<T>()` type-assertion pattern, onto a Zod schema both `api` and `web` validate
+  against. Writing it surfaced a real pre-existing drift (a hand-written type claimed a field —
+  `entity_count` — this response never actually returns) and two bugs in the schema itself,
+  caught on the first real request rather than in review. Verified: a deliberately renamed
+  field failed `web`'s typecheck and the live API request with a `500`, on the same real
+  request; reverted after confirming both.
 
 An "AI Project Improvements & Persistent Memory System" proposal (multi-agent decision
 personas, a knowledge-graph world model, confidence/scenario engines, an autonomous
@@ -368,5 +376,7 @@ What's left before a design-partner pilot: DPIA/records-of-processing tooling, a
 backend-for-frontend to move browser tokens out of `sessionStorage` into an httpOnly cookie
 (`DECISIONS.md` #11) — plus an actual cloud deployment to an EU host, none of which exist yet
 because there's no shared environment to deploy to. `docs/PLAN.md` phases the remaining PRD
-v1.1 items (API type safety, deployment, backup/restore — async ingestion, XLSX ingestion, and
-retention enforcement are done); the BFF/token item isn't yet in that plan.
+v1.1 items (deployment, backup/restore — async ingestion, XLSX ingestion, retention enforcement,
+and the first shared-schema route are done); the BFF/token item isn't yet in that plan, and only
+one of many routes has a shared schema so far (`shared/README.md` has the pattern for migrating
+the rest incrementally).
