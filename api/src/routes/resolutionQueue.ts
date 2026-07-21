@@ -3,21 +3,46 @@ import { withRequestContext } from "../db.js";
 import { writeAudit } from "../audit.js";
 
 const DECISIONS = ["merged", "not_a_match", "skipped"] as const;
+const MAX_NEIGHBORS_PER_OBJECT = 5;
 
-async function neighborsFor(client: import("pg").PoolClient, objectId: string) {
-  const { rows } = await client.query(
-    `SELECT rt.name AS relationship,
-            neighbor.id AS neighbor_id,
-            ot.name AS neighbor_type
+type NeighborRow = { anchor_id: string; relationship: string; neighbor_id: string; neighbor_type: string };
+type Neighbor = { relationship: string; neighbor_id: string; neighbor_type: string };
+
+// Fetches "up to 5 neighbors" for every object in `objectIds` in one round trip, instead of the
+// two-query-per-pair (up to 200 round trips for a full 100-pair queue page) the previous
+// per-object neighborsFor() required. Each anchor object's edges are found from both directions
+// (UNION ALL of "anchor is source" and "anchor is target") so two candidate objects that happen
+// to be directly connected to each other still each see the other as a neighbor — the same
+// outcome the old per-object queries gave, just computed together.
+async function neighborsForBatch(client: import("pg").PoolClient, objectIds: string[]): Promise<Map<string, Neighbor[]>> {
+  const byAnchor = new Map<string, Neighbor[]>();
+  if (objectIds.length === 0) return byAnchor;
+
+  const { rows } = await client.query<NeighborRow>(
+    `SELECT e.source_object_id AS anchor_id, rt.name AS relationship, tgt.id AS neighbor_id, tgt_type.name AS neighbor_type
      FROM edges e
      JOIN relationship_types rt ON rt.id = e.relationship_type_id
-     JOIN objects neighbor ON neighbor.id = CASE WHEN e.source_object_id = $1 THEN e.target_object_id ELSE e.source_object_id END
-     JOIN object_types ot ON ot.id = neighbor.object_type_id
-     WHERE e.source_object_id = $1 OR e.target_object_id = $1
-     LIMIT 5`,
-    [objectId],
+     JOIN objects tgt ON tgt.id = e.target_object_id
+     JOIN object_types tgt_type ON tgt_type.id = tgt.object_type_id
+     WHERE e.source_object_id = ANY($1::uuid[])
+     UNION ALL
+     SELECT e.target_object_id AS anchor_id, rt.name AS relationship, src.id AS neighbor_id, src_type.name AS neighbor_type
+     FROM edges e
+     JOIN relationship_types rt ON rt.id = e.relationship_type_id
+     JOIN objects src ON src.id = e.source_object_id
+     JOIN object_types src_type ON src_type.id = src.object_type_id
+     WHERE e.target_object_id = ANY($1::uuid[])`,
+    [objectIds],
   );
-  return rows;
+
+  for (const row of rows) {
+    const list = byAnchor.get(row.anchor_id) ?? [];
+    // Keeps the response shape identical to the old per-object query (relationship/neighbor_id/
+    // neighbor_type only) — anchor_id was only ever needed to group these rows just above.
+    if (list.length < MAX_NEIGHBORS_PER_OBJECT) list.push({ relationship: row.relationship, neighbor_id: row.neighbor_id, neighbor_type: row.neighbor_type });
+    byAnchor.set(row.anchor_id, list);
+  }
+  return byAnchor;
 }
 
 const resolutionQueueRoutes: FastifyPluginAsync = async (app) => {
@@ -36,20 +61,33 @@ const resolutionQueueRoutes: FastifyPluginAsync = async (app) => {
         [status ?? "pending"],
       );
 
+      // Batched: one query for every object across every pair, one query for every neighbor
+      // across every object, instead of up to 3 queries per pair (up to 300 round trips for a
+      // full 100-pair page).
+      const allObjectIds = Array.from(new Set(pairs.flatMap((p) => [p.object_a_id, p.object_b_id])));
+      const { rows: objRows } = allObjectIds.length
+        ? await client.query(
+            `SELECT o.id, ot.name AS object_type, o.properties, o.classification
+             FROM objects o JOIN object_types ot ON ot.id = o.object_type_id
+             WHERE o.id = ANY($1::uuid[])`,
+            [allObjectIds],
+          )
+        : { rows: [] };
+      const objectsById = new Map(objRows.map((o) => [o.id, o]));
+      const neighborsByObjectId = await neighborsForBatch(client, allObjectIds);
+
       const enriched = [];
       for (const pair of pairs) {
-        const { rows: objRows } = await client.query(
-          `SELECT o.id, ot.name AS object_type, o.properties, o.classification
-           FROM objects o JOIN object_types ot ON ot.id = o.object_type_id
-           WHERE o.id = ANY($1::uuid[])`,
-          [[pair.object_a_id, pair.object_b_id]],
-        );
-        const objectA = objRows.find((o) => o.id === pair.object_a_id);
-        const objectB = objRows.find((o) => o.id === pair.object_b_id);
+        const objectA = objectsById.get(pair.object_a_id);
+        const objectB = objectsById.get(pair.object_b_id);
         if (!objectA || !objectB) continue; // not visible to this session's clearance
-        const neighborsA = await neighborsFor(client, pair.object_a_id);
-        const neighborsB = await neighborsFor(client, pair.object_b_id);
-        enriched.push({ ...pair, objectA, objectB, neighborsA, neighborsB });
+        enriched.push({
+          ...pair,
+          objectA,
+          objectB,
+          neighborsA: neighborsByObjectId.get(pair.object_a_id) ?? [],
+          neighborsB: neighborsByObjectId.get(pair.object_b_id) ?? [],
+        });
       }
       return enriched;
     });

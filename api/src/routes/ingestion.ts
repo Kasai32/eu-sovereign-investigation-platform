@@ -194,11 +194,23 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
           `INSERT INTO objects (id, object_type_id, properties, classification) VALUES ($1, $2, $3::jsonb, $4)`,
           [objectId, template.object_type_id, JSON.stringify(properties), source.default_classification],
         );
-        for (const key of Object.keys(properties)) {
+
+        // One multi-row INSERT instead of one round trip per property — for a row with K
+        // mapped columns this was K sequential awaited queries; a 1,000-row file with 5 mapped
+        // columns issued ~5,000 of these alone. Row ordering/timing relative to the object
+        // insert and the similarity check right below is unchanged, only this inner loop is
+        // collapsed.
+        const propertyKeys = Object.keys(properties);
+        if (propertyKeys.length > 0) {
+          // $1-$4 are shared across every row of this VALUES list (object_id, source name,
+          // classification, raw_source_ref are all constant for this ingested row); only
+          // property_key varies, one placeholder per key starting at $5.
+          const rawSourceRef = `run:${runId}#row:${i + 1}`;
+          const valuesSql = propertyKeys.map((_, k) => `($1, $${k + 5}, $2, 1.0, $3, $4)`).join(", ");
           await client.query(
             `INSERT INTO object_property_meta (object_id, property_key, source, confidence, classification, raw_source_ref)
-             VALUES ($1, $2, $3, 1.0, $4, $5)`,
-            [objectId, key, source.name, source.default_classification, `run:${runId}#row:${i + 1}`],
+             VALUES ${valuesSql}`,
+            [objectId, source.name, source.default_classification, rawSourceRef, ...propertyKeys],
           );
         }
         ingested++;

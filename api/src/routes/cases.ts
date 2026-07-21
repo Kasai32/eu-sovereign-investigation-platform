@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { FastifyPluginAsync } from "fastify";
 import { withRequestContext } from "../db.js";
 import { writeAudit } from "../audit.js";
+import { ClauseBuilder } from "../lib/clauseBuilder.js";
 
 const STATUSES = ["open", "under_review", "closed", "archived"] as const;
 
@@ -12,22 +13,12 @@ const casesRoutes: FastifyPluginAsync = async (app) => {
     const q = request.query as { status?: string; assignedTo?: string; purpose?: string };
 
     const cases = await withRequestContext(request.ctx, async (client) => {
-      const conditions: string[] = [];
-      const params: unknown[] = [];
-      if (q.status) {
-        params.push(q.status);
-        conditions.push(`c.status = $${params.length}`);
-      }
-      if (q.assignedTo) {
-        params.push(q.assignedTo);
-        conditions.push(`c.assigned_to = $${params.length}`);
-      }
-      const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+      const filter = new ClauseBuilder().add("c.status", q.status).add("c.assigned_to", q.assignedTo);
       const { rows } = await client.query(
         `SELECT c.id, c.title, c.status, c.priority, c.classification, c.assigned_to, c.created_by, c.created_at,
                 (SELECT count(*) FROM case_entities ce WHERE ce.case_id = c.id) AS entity_count
-         FROM cases c ${where} ORDER BY c.created_at DESC LIMIT 100`,
-        params,
+         FROM cases c ${filter.where()} ORDER BY c.created_at DESC LIMIT 100`,
+        filter.values,
       );
       await writeAudit(client, {
         userId: request.ctx!.userId,

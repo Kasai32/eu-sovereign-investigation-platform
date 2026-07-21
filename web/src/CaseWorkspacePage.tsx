@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useParams } from "@tanstack/react-router";
 import { useApiClient, type GraphEdge, type GraphNode } from "./lib/api";
+import { usePurposeGate } from "./lib/usePurposeGate";
 import { ClassificationBadge } from "./components/ClassificationBadge";
 import { GraphCanvas } from "./components/GraphCanvas";
 
@@ -25,8 +26,11 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
   const api = useApiClient();
   const queryClient = useQueryClient();
 
-  const [purpose, setPurpose] = useState("");
-  const [submittedPurpose, setSubmittedPurpose] = useState("");
+  const { submittedPurpose, gate } = usePurposeGate({
+    title: "Reason for opening this case",
+    description: "Required before opening the case workspace — recorded in the audit log against your account.",
+    placeholder: "e.g. reviewing assigned structuring alert",
+  });
 
   const caseQuery = useQuery({
     queryKey: ["case", caseId, submittedPurpose],
@@ -128,34 +132,7 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
     setSelectedNodeId(null);
   }
 
-  if (!submittedPurpose) {
-    return (
-      <div className="mx-auto max-w-md">
-        <h1 className="mb-2 text-xl font-semibold text-slate-900">Reason for opening this case</h1>
-        <p className="mb-4 text-sm text-slate-500">
-          Required before opening the case workspace — recorded in the audit log against your account.
-        </p>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (purpose.trim()) setSubmittedPurpose(purpose.trim());
-          }}
-          className="flex gap-2"
-        >
-          <input
-            value={purpose}
-            onChange={(e) => setPurpose(e.target.value)}
-            placeholder="e.g. reviewing assigned structuring alert"
-            className="flex-1 rounded border border-slate-300 px-3 py-1.5 text-sm"
-            autoFocus
-          />
-          <button type="submit" className="rounded bg-slate-900 px-4 py-1.5 text-sm text-white hover:bg-slate-700">
-            Continue
-          </button>
-        </form>
-      </div>
-    );
-  }
+  if (gate) return gate;
 
   if (caseQuery.isLoading) return <p className="text-sm text-slate-500">Loading…</p>;
   if (caseQuery.error) {

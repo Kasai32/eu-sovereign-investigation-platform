@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
 import { withRequestContext } from "../db.js";
 import { writeAudit } from "../audit.js";
+import { ClauseBuilder } from "../lib/clauseBuilder.js";
 
 const ROLES = ["analyst", "supervisor", "compliance", "admin"];
 const CLEARANCES = ["PUBLIC", "INTERNAL", "SENSITIVE", "RESTRICTED"];
@@ -34,24 +35,11 @@ const adminRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const result = await withRequestContext(request.ctx, async (client) => {
-      const sets: string[] = [];
-      const params: unknown[] = [];
-      if (body.role) {
-        params.push(body.role);
-        sets.push(`role = $${params.length}`);
-      }
-      if (body.clearance) {
-        params.push(body.clearance);
-        sets.push(`clearance = $${params.length}`);
-      }
-      if (body.isActive !== undefined) {
-        params.push(body.isActive);
-        sets.push(`is_active = $${params.length}`);
-      }
-      if (sets.length === 0) return { error: "nothing to update" as const };
-      params.push(id);
+      const set = new ClauseBuilder().add("role", body.role).add("clearance", body.clearance).add("is_active", body.isActive);
+      if (set.isEmpty) return { error: "nothing to update" as const };
+      const idIdx = set.param(id);
 
-      await client.query(`UPDATE app_users SET ${sets.join(", ")} WHERE id = $${params.length}`, params);
+      await client.query(`UPDATE app_users SET ${set.set()} WHERE id = $${idIdx}`, set.values);
       const { rows } = await client.query(
         `SELECT id, email, display_name, role, clearance, is_active FROM app_users WHERE id = $1`,
         [id],

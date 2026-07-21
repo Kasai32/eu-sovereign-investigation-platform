@@ -1,7 +1,7 @@
-import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "@tanstack/react-router";
 import { useApiClient, type CaseReport } from "./lib/api";
+import { usePurposeGate } from "./lib/usePurposeGate";
 import { ClassificationBadge } from "./components/ClassificationBadge";
 
 function displayLabel(props: Record<string, unknown>, fallback: string): string {
@@ -58,8 +58,10 @@ function downloadMarkdown(report: CaseReport) {
 export function CaseReportPage() {
   const { id: caseId } = useParams({ from: "/cases/$id/report" });
   const api = useApiClient();
-  const [purpose, setPurpose] = useState("");
-  const [submittedPurpose, setSubmittedPurpose] = useState("");
+  const { submittedPurpose, gate } = usePurposeGate({
+    title: "Reason for exporting this report",
+    placeholder: "e.g. preparing SAR filing package",
+  });
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["case-report", caseId, submittedPurpose],
@@ -67,32 +69,7 @@ export function CaseReportPage() {
     enabled: submittedPurpose.length > 0,
   });
 
-  if (!submittedPurpose) {
-    return (
-      <div className="mx-auto max-w-md">
-        <h1 className="mb-2 text-xl font-semibold text-slate-900">Reason for exporting this report</h1>
-        <p className="mb-4 text-sm text-slate-500">Required — recorded in the audit log against your account.</p>
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (purpose.trim()) setSubmittedPurpose(purpose.trim());
-          }}
-          className="flex gap-2"
-        >
-          <input
-            value={purpose}
-            onChange={(e) => setPurpose(e.target.value)}
-            placeholder="e.g. preparing SAR filing package"
-            className="flex-1 rounded border border-slate-300 px-3 py-1.5 text-sm"
-            autoFocus
-          />
-          <button type="submit" className="rounded bg-slate-900 px-4 py-1.5 text-sm text-white hover:bg-slate-700">
-            Continue
-          </button>
-        </form>
-      </div>
-    );
-  }
+  if (gate) return gate;
 
   if (isLoading) return <p className="mx-auto max-w-3xl text-sm text-slate-500">Loading…</p>;
   if (error) return <p className="mx-auto max-w-3xl text-sm text-red-600">{(error as Error).message}</p>;

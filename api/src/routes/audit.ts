@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
 import { withRequestContext } from "../db.js";
 import { writeAudit } from "../audit.js";
+import { ClauseBuilder } from "../lib/clauseBuilder.js";
 
 // Compliance/admin only, enforced twice: here at the route (defense-in-depth, matches the
 // build prompt's "not just an app-level if-check" warning) AND at the database via
@@ -25,36 +26,19 @@ const auditRoutes: FastifyPluginAsync = async (app) => {
     if (!q.purpose) return reply.code(400).send({ error: "purpose query param is required to view the audit log" });
 
     const result = await withRequestContext(request.ctx, async (client) => {
-      const conditions: string[] = [];
-      const params: unknown[] = [];
-      if (q.userId) {
-        params.push(q.userId);
-        conditions.push(`a.user_id = $${params.length}`);
-      }
-      if (q.action) {
-        params.push(q.action);
-        conditions.push(`a.action = $${params.length}`);
-      }
-      if (q.resourceType) {
-        params.push(q.resourceType);
-        conditions.push(`a.resource_type = $${params.length}`);
-      }
-      if (q.from) {
-        params.push(q.from);
-        conditions.push(`a.occurred_at >= $${params.length}`);
-      }
-      if (q.to) {
-        params.push(q.to);
-        conditions.push(`a.occurred_at <= $${params.length}`);
-      }
-      const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-      params.push(Math.min(Number(q.limit ?? 100), 500));
+      const filter = new ClauseBuilder()
+        .add("a.user_id", q.userId)
+        .add("a.action", q.action)
+        .add("a.resource_type", q.resourceType)
+        .add("a.occurred_at", q.from, ">=")
+        .add("a.occurred_at", q.to, "<=");
+      const limitIdx = filter.param(Math.min(Number(q.limit ?? 100), 500));
       const { rows: entries } = await client.query(
         `SELECT a.seq, a.user_id, u.display_name AS user_name, a.action, a.resource_type, a.resource_id,
                 a.purpose, a.details, a.occurred_at
          FROM audit_log a LEFT JOIN app_users u ON u.id = a.user_id
-         ${where} ORDER BY a.seq DESC LIMIT $${params.length}`,
-        params,
+         ${filter.where()} ORDER BY a.seq DESC LIMIT $${limitIdx}`,
+        filter.values,
       );
       const { rows: chainCheck } = await client.query(`SELECT * FROM verify_audit_log()`);
 

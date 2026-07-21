@@ -1,6 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
 import { withRequestContext } from "../db.js";
 import { writeAudit } from "../audit.js";
+import { ClauseBuilder } from "../lib/clauseBuilder.js";
 
 const objectsRoutes: FastifyPluginAsync = async (app) => {
   // Faceted search: type/name filters, RLS silently restricts to what the session may see —
@@ -13,26 +14,18 @@ const objectsRoutes: FastifyPluginAsync = async (app) => {
     const purpose = q.purpose ?? "routine investigation browse";
 
     const objects = await withRequestContext(request.ctx, async (client) => {
-      const conditions: string[] = [];
-      const params: unknown[] = [];
-      if (q.type) {
-        params.push(q.type);
-        conditions.push(`ot.name = $${params.length}`);
-      }
-      if (q.q) {
-        params.push(q.q);
-        conditions.push(`similarity(o.properties->>'name', $${params.length}) > 0.2`);
-      }
-      const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-      params.push(limit);
-      params.push(offset);
+      const filter = new ClauseBuilder()
+        .add("ot.name", q.type)
+        .addRaw((i) => `similarity(o.properties->>'name', $${i}) > 0.2`, q.q);
+      const limitIdx = filter.param(limit);
+      const offsetIdx = filter.param(offset);
       const { rows } = await client.query(
         `SELECT o.id, ot.name AS object_type, o.properties, o.classification, o.created_at
          FROM objects o JOIN object_types ot ON ot.id = o.object_type_id
-         ${where}
+         ${filter.where()}
          ORDER BY o.created_at DESC
-         LIMIT $${params.length - 1} OFFSET $${params.length}`,
-        params,
+         LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+        filter.values,
       );
       await writeAudit(client, {
         userId: request.ctx!.userId,
