@@ -552,3 +552,50 @@ classification, and 1 quarantined row with a precise "no matching target object"
 crashed a real 3,000-row edge-ingestion run at 1,000 rows and resumed it with the same file:
 completed at exactly 3,000 total edges, confirmed zero duplicates by direct count.
 **Source:** `db/migrations/013_edge_mapping_templates.sql`, `api/src/routes/ingestion.ts`
+
+### #46 — Shared Zod schemas for `GET /cases/:id`, closing the first route (PRD v1.1 N5)
+
+**Choice:** `shared/schemas/caseDetail.ts` — a new top-level directory, not an npm workspace —
+is the single source of truth for this route's request/response shape. `api/src/routes/cases/
+workspace.ts` validates the request query/params and the constructed response against it before
+`reply.send(...)`; `web/src/lib/api/cases.ts`'s `getCase` validates the fetched JSON against the
+same schema via a new `requestWithSchema()` helper in `client.ts`. `web/src/lib/api/types.ts`'s
+`CaseEntity`/`CaseNote`/`CaseActivity`/`CaseMember`/`CaseDetail` are now re-exports of the
+schema's inferred types under their existing names, so no other file that imports them changed.
+`api` and `web` are two independent npm projects (no root `package.json`); `shared/` is wired in
+via each project's `tsconfig.json` `include` (plus `rootDir` in `api`'s, and `server.fs.allow` in
+`web/vite.config.ts`) rather than a package boundary — see `shared/README.md` for the exact
+mechanics and how to add the next route's schema.
+
+**Reason:** N5 in the PRD — `request<T>(...)` on the web side was (and everywhere except this
+one route still is) a bare type assertion with no runtime check, so a response shape change
+surfaces as a silent `undefined` wherever the missing field gets read, not a build failure.
+`GET /cases/:id` was chosen over `/graph/expand` (PLAN.md's other suggested candidate) because
+writing its schema immediately surfaced a real, pre-existing drift: the hand-written `CaseDetail`
+type's `case` field claimed `entity_count` (copied from the list endpoint's row shape, which
+does compute it via a subquery — `cases/queue.ts`), but `SELECT * FROM cases WHERE id = $1`
+(`cases/workspace.ts`) never returns it. Nothing read it from this response yet, so it was a
+live, silent trap rather than a caught bug — exactly the failure mode this phase exists to close.
+
+**Bugs the schema itself caught, not code review, on the very first real request:**
+1. Zod's default `.uuid()` enforces RFC4122 version/variant nibbles; this codebase's seed data
+   uses deliberately simple ids (`11111111-1111-1111-1111-111111111104` for `app_users`) that
+   are valid Postgres `uuid` values but fail that stricter check. Switched every id field to
+   `z.guid()` (hex-shape only, no version/variant requirement) — matching what the Postgres
+   column type itself actually enforces, not a tighter constraint invented on top of it.
+2. `pg` returns `timestamp`/`timestamptz` columns as JS `Date` objects, not strings; validating
+   the response *before* Fastify's `reply.send()` JSON-serializes it (the whole point — catching
+   a mismatch before anything ships, not after) means the schema saw raw `Date` values. Added an
+   `isoTimestampSchema` that accepts either and transforms to an ISO string, making explicit what
+   was previously an implicit, invisible side effect of `JSON.stringify`.
+
+**Verified**, not just asserted: the real case workspace page renders end-to-end through the
+validated round trip (screenshot-checked in a real browser, not just typecheck). Then
+deliberately renamed `author_name` → `authorName` in the shared schema only: `web`'s typecheck
+failed with a precise `TS2551` pointing at the exact consuming line in
+`CaseWorkspacePage.tsx`, and the live API request failed with a `500` and a Zod error naming the
+exact missing field — both directions of the acceptance bar, on the same real request, not two
+different contrived examples. Reverted; both green again.
+**Source:** `shared/schemas/caseDetail.ts`, `shared/README.md`, `api/src/routes/cases/
+workspace.ts`, `web/src/lib/api/cases.ts`, `web/src/lib/api/client.ts`, `web/src/lib/api/
+types.ts`, `api/tsconfig.json`, `web/tsconfig.json`, `web/vite.config.ts`
