@@ -12,6 +12,7 @@ import { useAuth } from "./lib/AuthContext";
 import { handleCallback } from "./lib/auth";
 import { useApiClient, ApiError, type CaseSummary } from "./lib/api";
 import { ClassificationBadge } from "./components/ClassificationBadge";
+import { CaseWorkspacePage } from "./CaseWorkspacePage";
 
 // ---------------------------------------------------------------------------
 // Root layout: shows a sign-in screen when unauthenticated, nav + Outlet otherwise. The
@@ -61,7 +62,7 @@ function RootLayout() {
           </button>
         </div>
       </nav>
-      <main className="mx-auto max-w-5xl p-6">
+      <main className="p-6">
         <Outlet />
       </main>
     </div>
@@ -119,7 +120,7 @@ function SearchPage() {
   });
 
   return (
-    <div>
+    <div className="mx-auto max-w-5xl">
       <h1 className="mb-4 text-xl font-semibold text-slate-900">Search</h1>
       <form
         onSubmit={(e) => {
@@ -248,7 +249,7 @@ function ObjectDetailPage() {
   if (!data) return null;
 
   return (
-    <div>
+    <div className="mx-auto max-w-5xl">
       <div className="mb-4 flex items-center gap-3">
         <h1 className="text-xl font-semibold text-slate-900">
           {(data.object.properties.name as string) ?? data.object.id}
@@ -328,7 +329,7 @@ function CasesPage() {
   });
 
   return (
-    <div>
+    <div className="mx-auto max-w-5xl">
       <div className="mb-4 flex items-center justify-between">
         <h1 className="text-xl font-semibold text-slate-900">Cases</h1>
         <button
@@ -393,7 +394,11 @@ function CasesPage() {
           <tbody>
             {data.cases.map((c: CaseSummary) => (
               <tr key={c.id} className="border-b border-slate-100">
-                <td className="py-2 pr-4 text-slate-900">{c.title}</td>
+                <td className="py-2 pr-4">
+                  <Link to="/cases/$id" params={{ id: c.id }} className="text-slate-900 hover:underline">
+                    {c.title}
+                  </Link>
+                </td>
                 <td className="py-2 pr-4 text-slate-600">{c.status}</td>
                 <td className="py-2 pr-4 text-slate-600">{c.priority}</td>
                 <td className="py-2 pr-4">
@@ -418,7 +423,23 @@ function CasesPage() {
 
 const casesRoute = createRoute({ getParentRoute: () => rootRoute, path: "/cases", component: CasesPage });
 
-const routeTree = rootRoute.addChildren([indexRoute, callbackRoute, searchRoute, objectDetailRoute, casesRoute]);
+// S2: case workspace. Defined in a separate file (CaseWorkspacePage.tsx) since it's
+// substantially larger than the other screens; it reads its :id param via useParams({ from:
+// "/cases/$id" }) rather than importing this route object, avoiding a circular import.
+const caseWorkspaceRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/cases/$id",
+  component: CaseWorkspacePage,
+});
+
+const routeTree = rootRoute.addChildren([
+  indexRoute,
+  callbackRoute,
+  searchRoute,
+  objectDetailRoute,
+  casesRoute,
+  caseWorkspaceRoute,
+]);
 
 export const router = createRouter({ routeTree });
 

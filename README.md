@@ -131,9 +131,38 @@ Sign in as any seed user (e.g. `sam.supervisor` / `devpassword123`) at the Keycl
 you're redirected to. Entity detail requires typing a reason for viewing first — that's not
 decorative, the API 400s without it and the audit log records exactly what you typed.
 
+## Phase 3: case workspace (S2)
+
+The blueprint's own "60% of build effort" screen. Click any case title in the queue to open it.
+Three panes: case file (entities/notes/activity, left), Cytoscape.js graph canvas (center,
+force-directed layout, click to select/expand, path-finding between two nodes), entity/edge
+inspector (right, with add/remove-from-case). Selecting anything in one pane highlights it in
+the other two — proven with a real integration test, not just wired up, per the build prompt's
+explicit instruction. See `PHASE3_REVIEW.md`, including a genuine concurrency bug in the audit
+hash chain found and fixed during this phase's verification (migration 008).
+
+```
+web/src/
+  CaseWorkspacePage.tsx      route wrapper (useParams) + CaseWorkspace (the actual 3-pane UI,
+                              kept separate so it's testable without a router)
+  CaseWorkspacePage.test.tsx  cross-pane linked-selection integration test (Vitest + RTL)
+  components/GraphCanvas.tsx  Cytoscape wrapper: props -> cy instance sync via effects
+api/src/routes/
+  cases.ts   + GET /cases/:id/graph, DELETE /cases/:id/entities/:objectId
+  graph.ts   + GET /graph/path (server-side shortest path, recursive CTE)
+```
+
+### Running Phase 3
+
+Same as Phase 2 (`docker compose up -d`, migrate, seed, run `api` then `web`), plus:
+
+```bash
+cd web && npm test   # linked-selection integration test
+```
+
 ## Status
 
-Phase 0 (schema + RLS + audit chain + synthetic seed), Phase 1 (API layer + real Keycloak auth),
-and Phase 2 (S1/S3/S4 frontend) are done and verified — see `PHASE0_REVIEW.md`,
-`PHASE1_REVIEW.md`, `PHASE2_REVIEW.md`. Next: Phase 3 — S2 case workspace (graph canvas via
-Cytoscape.js, case file, linked selection).
+Phase 0 (schema + RLS + audit chain + synthetic seed), Phase 1 (API + real Keycloak auth),
+Phase 2 (S1/S3/S4 frontend), and Phase 3 (S2 case workspace) are done and verified — see
+`PHASE0_REVIEW.md` through `PHASE3_REVIEW.md`. Next: Phase 4 — S5 ingestion (CSV upload +
+column mapping) and S6 (entity-resolution review queue), per the blueprint's build order.

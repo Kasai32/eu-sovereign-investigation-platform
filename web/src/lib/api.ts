@@ -56,6 +56,49 @@ export type CaseSummary = {
   entity_count: number;
 };
 
+export type CaseEntity = {
+  object_id: string;
+  object_type: string;
+  properties: Record<string, unknown>;
+  classification: string;
+  pinned_by: string;
+  pinned_at: string;
+};
+
+export type CaseNote = { id: string; body: string; author_id: string; author_name: string; created_at: string };
+export type CaseActivity = {
+  id: string;
+  action: string;
+  details: Record<string, unknown>;
+  actor_id: string;
+  actor_name: string;
+  occurred_at: string;
+};
+export type CaseMember = { user_id: string; display_name: string; role: string };
+
+export type CaseDetail = {
+  case: CaseSummary & { evidence_snapshot: unknown; closed_at: string | null };
+  entities: CaseEntity[];
+  notes: CaseNote[];
+  activity: CaseActivity[];
+  members: CaseMember[];
+};
+
+export type GraphNode = { id: string; object_type: string; properties: Record<string, unknown>; classification: string };
+export type GraphEdge = {
+  id: string;
+  source_object_id: string;
+  target_object_id: string;
+  relationship: string;
+  properties: Record<string, unknown>;
+  classification: string;
+};
+
+export type ExpandResult = { nodes: GraphNode[]; edges: GraphEdge[]; truncated: boolean; requestedHops: number };
+export type PathResult =
+  | { found: false; nodes: []; edges: [] }
+  | { found: true; path: string[]; hops: number; nodes: GraphNode[]; edges: GraphEdge[] };
+
 async function request<T>(path: string, token: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_URL}${path}`, {
     ...init,
@@ -109,6 +152,53 @@ export function useApiClient() {
         withToken((token) =>
           request<CaseSummary>("/cases", token, { method: "POST", body: JSON.stringify(body) }),
         ),
+
+      getCase: (id: string, purpose: string) =>
+        withToken((token) => request<CaseDetail>(`/cases/${id}?purpose=${encodeURIComponent(purpose)}`, token)),
+
+      getCaseGraph: (id: string) =>
+        withToken((token) => request<{ nodes: GraphNode[]; edges: GraphEdge[] }>(`/cases/${id}/graph`, token)),
+
+      addNote: (caseId: string, body: string, purpose?: string) =>
+        withToken((token) =>
+          request<CaseNote>(`/cases/${caseId}/notes`, token, {
+            method: "POST",
+            body: JSON.stringify({ body, purpose }),
+          }),
+        ),
+
+      pinEntity: (caseId: string, objectId: string, purpose?: string) =>
+        withToken((token) =>
+          request<{ ok: true }>(`/cases/${caseId}/entities`, token, {
+            method: "POST",
+            body: JSON.stringify({ objectId, purpose }),
+          }),
+        ),
+
+      unpinEntity: (caseId: string, objectId: string, purpose?: string) =>
+        withToken((token) => {
+          const qs = purpose ? `?purpose=${encodeURIComponent(purpose)}` : "";
+          return request<{ ok: true }>(`/cases/${caseId}/entities/${objectId}${qs}`, token, { method: "DELETE" });
+        }),
+
+      setCaseStatus: (caseId: string, status: string, purpose: string) =>
+        withToken((token) =>
+          request(`/cases/${caseId}/status`, token, { method: "PATCH", body: JSON.stringify({ status, purpose }) }),
+        ),
+
+      expandGraph: (nodeId: string, hops: number, purpose?: string) =>
+        withToken((token) => {
+          const search = new URLSearchParams({ nodeId, hops: String(hops) });
+          if (purpose) search.set("purpose", purpose);
+          return request<ExpandResult>(`/graph/expand?${search.toString()}`, token);
+        }),
+
+      findPath: (from: string, to: string, purpose?: string) =>
+        withToken((token) => {
+          const search = new URLSearchParams({ from, to });
+          if (purpose) search.set("purpose", purpose);
+          return request<PathResult>(`/graph/path?${search.toString()}`, token);
+        }),
     };
   }, [getValidAccessToken]);
 }

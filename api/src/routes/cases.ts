@@ -171,6 +171,48 @@ const casesRoutes: FastifyPluginAsync = async (app) => {
     reply.code(201).send(note);
   });
 
+  // Seeds the S2 graph canvas: the case's pinned entities as nodes, plus edges among just
+  // those objects (interactive expansion from a node uses /graph/expand separately).
+  app.get("/cases/:id/graph", async (request, reply) => {
+    if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
+    const { id } = request.params as { id: string };
+
+    const result = await withRequestContext(request.ctx, async (client) => {
+      const { rows: entityRows } = await client.query(
+        `SELECT object_id FROM case_entities WHERE case_id = $1`,
+        [id],
+      );
+      const ids = entityRows.map((r) => r.object_id);
+      if (ids.length === 0) return { nodes: [], edges: [] };
+
+      const { rows: nodes } = await client.query(
+        `SELECT o.id, ot.name AS object_type, o.properties, o.classification
+         FROM objects o JOIN object_types ot ON ot.id = o.object_type_id
+         WHERE o.id = ANY($1::uuid[])`,
+        [ids],
+      );
+      const { rows: edges } = await client.query(
+        `SELECT e.id, e.source_object_id, e.target_object_id, rt.name AS relationship,
+                e.properties, e.classification
+         FROM edges e JOIN relationship_types rt ON rt.id = e.relationship_type_id
+         WHERE e.source_object_id = ANY($1::uuid[]) AND e.target_object_id = ANY($1::uuid[])`,
+        [ids],
+      );
+
+      await writeAudit(client, {
+        userId: request.ctx!.userId,
+        action: "case.graph.view",
+        resourceType: "case",
+        resourceId: id,
+        purpose: "viewing case investigation graph",
+      });
+
+      return { nodes, edges };
+    });
+
+    reply.send(result);
+  });
+
   app.post("/cases/:id/entities", async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
     const { id } = request.params as { id: string };
@@ -192,6 +234,30 @@ const casesRoutes: FastifyPluginAsync = async (app) => {
         resourceType: "case",
         resourceId: id,
         purpose: purpose ?? "entity pinned to case",
+        details: { objectId },
+      });
+    });
+
+    reply.send({ ok: true });
+  });
+
+  app.delete("/cases/:id/entities/:objectId", async (request, reply) => {
+    if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
+    const { id, objectId } = request.params as { id: string; objectId: string };
+    const { purpose } = (request.query as { purpose?: string }) ?? {};
+
+    await withRequestContext(request.ctx, async (client) => {
+      await client.query(`DELETE FROM case_entities WHERE case_id = $1 AND object_id = $2`, [id, objectId]);
+      await client.query(
+        `INSERT INTO case_activity (case_id, actor_id, action, details) VALUES ($1, $2, 'entity_unpinned', $3::jsonb)`,
+        [id, request.ctx!.userId, JSON.stringify({ objectId })],
+      );
+      await writeAudit(client, {
+        userId: request.ctx!.userId,
+        action: "case.entity.unpin",
+        resourceType: "case",
+        resourceId: id,
+        purpose: purpose ?? "entity removed from case",
         details: { objectId },
       });
     });
