@@ -160,9 +160,42 @@ Same as Phase 2 (`docker compose up -d`, migrate, seed, run `api` then `web`), p
 cd web && npm test   # linked-selection integration test
 ```
 
+## Phase 4: intake + entity resolution (S5, S6)
+
+CSV ingestion with column-mapping templates, run tracking, and quarantine (`/intake`, upload
+restricted to supervisor/compliance/admin; source/template management to admin), and a
+keyboard-driven entity-resolution review queue (`/resolution-queue`, open to any analyst).
+Ingestion both inserts new objects **and** runs fuzzy entity resolution against existing ones in
+the same pass: exact/near-exact matches auto-merge (reversible via `canonical_of`), ambiguous
+matches queue for human review, invalid rows quarantine — never auto-merging an ambiguous match,
+per the build prompt. Verified with a CSV that exercises all four outcomes at once, via curl and
+then again through a real file-upload + real keyboard shortcut in the browser. See
+`PHASE4_REVIEW.md`, including real gaps named rather than glossed over (retention days is
+configurable but not enforced; no intra-batch duplicate detection).
+
+```
+api/src/
+  objectValidation.ts        minimal schema validator (closes a Phase 0-flagged gap: schemas
+                              were stored but never enforced)
+  routes/objectTypes.ts       GET /object-types (also closes a Phase 2 gap: the search screen's
+                              type filter was hardcoded, now fetched)
+  routes/ingestion.ts         sources, mapping templates, CSV upload + entity resolution
+  routes/resolutionQueue.ts   S6: list pending pairs, decide, undo
+web/src/
+  IntakePage.tsx              S5
+  ResolutionQueuePage.tsx     S6
+```
+
+### Running Phase 4
+
+Same as before. Sign in as `adam.admin` to create sources/templates, or `sam.supervisor` to
+upload against ones that already exist. Any seed user can review the resolution queue.
+
 ## Status
 
 Phase 0 (schema + RLS + audit chain + synthetic seed), Phase 1 (API + real Keycloak auth),
-Phase 2 (S1/S3/S4 frontend), and Phase 3 (S2 case workspace) are done and verified — see
-`PHASE0_REVIEW.md` through `PHASE3_REVIEW.md`. Next: Phase 4 — S5 ingestion (CSV upload +
-column mapping) and S6 (entity-resolution review queue), per the blueprint's build order.
+Phase 2 (S1/S3/S4 frontend), Phase 3 (S2 case workspace), and Phase 4 (S5 intake + S6 entity
+resolution) are done and verified — see `PHASE0_REVIEW.md` through `PHASE4_REVIEW.md`. Next:
+S7's admin/audit UI (the `/audit` API route exists, unused by any screen yet) and hardening
+(ISO 27001 gap assessment, real secrets management) before the first design-partner pilot, per
+the strategy document's phasing.

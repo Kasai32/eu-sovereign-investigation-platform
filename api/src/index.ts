@@ -1,10 +1,14 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
+import multipart from "@fastify/multipart";
 import { authenticate } from "./auth.js";
 import objectsRoutes from "./routes/objects.js";
 import graphRoutes from "./routes/graph.js";
 import casesRoutes from "./routes/cases.js";
 import auditRoutes from "./routes/audit.js";
+import objectTypesRoutes from "./routes/objectTypes.js";
+import ingestionRoutes from "./routes/ingestion.js";
+import resolutionQueueRoutes from "./routes/resolutionQueue.js";
 
 const app = Fastify({ logger: true });
 
@@ -15,6 +19,10 @@ await app.register(cors, {
   credentials: true,
 });
 
+// 10MB cap on ingestion uploads — small enough to keep a bad file from tying up the process,
+// large enough for the CSV exports this v1 targets (per the blueprint, no live connectors yet).
+await app.register(multipart, { limits: { fileSize: 10 * 1024 * 1024 } });
+
 app.get("/health", async () => ({ ok: true }));
 
 app.register(async (secured) => {
@@ -23,6 +31,9 @@ app.register(async (secured) => {
   await secured.register(graphRoutes);
   await secured.register(casesRoutes);
   await secured.register(auditRoutes);
+  await secured.register(objectTypesRoutes);
+  await secured.register(ingestionRoutes);
+  await secured.register(resolutionQueueRoutes);
 });
 
 const port = Number(process.env.PORT ?? 3001);

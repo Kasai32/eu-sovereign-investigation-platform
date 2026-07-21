@@ -13,6 +13,8 @@ import { handleCallback } from "./lib/auth";
 import { useApiClient, ApiError, type CaseSummary } from "./lib/api";
 import { ClassificationBadge } from "./components/ClassificationBadge";
 import { CaseWorkspacePage } from "./CaseWorkspacePage";
+import { IntakePage } from "./IntakePage";
+import { ResolutionQueuePage } from "./ResolutionQueuePage";
 
 // ---------------------------------------------------------------------------
 // Root layout: shows a sign-in screen when unauthenticated, nav + Outlet otherwise. The
@@ -51,6 +53,15 @@ function RootLayout() {
           </Link>
           <Link to="/cases" className="text-sm text-slate-600 hover:text-slate-900 [&.active]:font-semibold [&.active]:text-slate-900">
             Cases
+          </Link>
+          <Link to="/intake" className="text-sm text-slate-600 hover:text-slate-900 [&.active]:font-semibold [&.active]:text-slate-900">
+            Intake
+          </Link>
+          <Link
+            to="/resolution-queue"
+            className="text-sm text-slate-600 hover:text-slate-900 [&.active]:font-semibold [&.active]:text-slate-900"
+          >
+            Resolution queue
           </Link>
         </div>
         <div className="flex items-center gap-3 text-sm text-slate-600">
@@ -106,8 +117,6 @@ const indexRoute = createRoute({
 // ---------------------------------------------------------------------------
 // S3: object search / explorer
 // ---------------------------------------------------------------------------
-const OBJECT_TYPES = ["Person", "Organization", "Account", "Location", "Device", "Alert", "Document"];
-
 function SearchPage() {
   const api = useApiClient();
   const [q, setQ] = useState("");
@@ -118,6 +127,11 @@ function SearchPage() {
     queryKey: ["objects", submittedQ, type],
     queryFn: () => api.listObjects({ q: submittedQ || undefined, type: type || undefined }),
   });
+
+  // Fetched, not hardcoded: object types are data (per the ontology design), so a new type
+  // added via ingestion templates shows up here without a frontend deploy. Was a hardcoded
+  // constant in Phase 2 — see PHASE2_REVIEW.md.
+  const objectTypesQuery = useQuery({ queryKey: ["object-types"], queryFn: () => api.listObjectTypes() });
 
   return (
     <div className="mx-auto max-w-5xl">
@@ -141,9 +155,9 @@ function SearchPage() {
           className="rounded border border-slate-300 px-3 py-1.5 text-sm"
         >
           <option value="">All types</option>
-          {OBJECT_TYPES.map((t) => (
-            <option key={t} value={t}>
-              {t}
+          {objectTypesQuery.data?.objectTypes.map((t) => (
+            <option key={t.id} value={t.name}>
+              {t.name}
             </option>
           ))}
         </select>
@@ -432,6 +446,13 @@ const caseWorkspaceRoute = createRoute({
   component: CaseWorkspacePage,
 });
 
+const intakeRoute = createRoute({ getParentRoute: () => rootRoute, path: "/intake", component: IntakePage });
+const resolutionQueueRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/resolution-queue",
+  component: ResolutionQueuePage,
+});
+
 const routeTree = rootRoute.addChildren([
   indexRoute,
   callbackRoute,
@@ -439,6 +460,8 @@ const routeTree = rootRoute.addChildren([
   objectDetailRoute,
   casesRoute,
   caseWorkspaceRoute,
+  intakeRoute,
+  resolutionQueueRoute,
 ]);
 
 export const router = createRouter({ routeTree });
