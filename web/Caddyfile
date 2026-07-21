@@ -1,0 +1,34 @@
+:8000 {
+	# Everything the tunnel exposes goes through this one origin — the web app, the API (under
+	# /api, prefix stripped before forwarding), and Keycloak's browser-facing endpoints. Same
+	# origin end to end means no CORS to configure for whatever hostname the tunnel assigns.
+	handle_path /api/* {
+		reverse_proxy api:4000
+	}
+
+	# cloudflared's own hop to Caddy is plain HTTP (the tunnel terminates TLS at Cloudflare's
+	# edge, not here), so Caddy's own default X-Forwarded-Proto reflects that local hop, not
+	# what the browser actually used. Keycloak (--proxy-headers=xforwarded, docker-compose.prod
+	# .yml) trusts that header to decide the scheme it stamps into issuer/redirect URLs — left
+	# alone it embeds http:// ones, which Chrome then blocks as insecure-mixed-content from an
+	# https:// page. Every hop in this deployment sits behind a tunnel that only ever terminates
+	# as https at the edge, so this is a correct fact about the deployment, not a workaround.
+	handle /realms/* {
+		reverse_proxy keycloak:8080 {
+			header_up X-Forwarded-Proto https
+		}
+	}
+
+	# Keycloak's login theme's CSS/JS/images.
+	handle /resources/* {
+		reverse_proxy keycloak:8080 {
+			header_up X-Forwarded-Proto https
+		}
+	}
+
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}
