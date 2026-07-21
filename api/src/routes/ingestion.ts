@@ -1,11 +1,83 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { FastifyBaseLogger, FastifyPluginAsync } from "fastify";
 import { parse } from "csv-parse/sync";
+import ExcelJS from "exceljs";
 import { pool, withRequestContext, type RequestContext } from "../db.js";
 import { writeAudit } from "../audit.js";
 import { validateProperties, type PropertySchema } from "../objectValidation.js";
 
 const PRIVILEGED_ROLES = ["supervisor", "compliance", "admin"];
+
+const XLSX_FILENAME = /\.xlsx$/i;
+
+// Renders one xlsx cell down to the same plain string every property downstream expects (CSV
+// rows are already all-string via csv-parse). Every ontology property is schema'd as `"type":
+// "string"` (db/seed/001_object_types.sql) and validateProperties rejects a non-string value for
+// one — a raw JS Date or number from a genuinely date/number-formatted Excel cell would
+// otherwise misfire as a validation error instead of ingesting.
+function xlsxCellToString(value: ExcelJS.CellValue): string {
+  if (value === null || value === undefined) return "";
+  if (value instanceof Date) {
+    const isDateOnly =
+      value.getUTCHours() === 0 && value.getUTCMinutes() === 0 && value.getUTCSeconds() === 0 && value.getUTCMilliseconds() === 0;
+    return isDateOnly ? value.toISOString().slice(0, 10) : value.toISOString();
+  }
+  if (typeof value === "object") {
+    // Rich text, hyperlink, and formula cells carry their display value under one of these
+    // keys instead of as the cell's raw value.
+    const obj = value as { text?: unknown; result?: unknown; richText?: { text: string }[] };
+    if (typeof obj.text === "string") return obj.text;
+    if (obj.richText) return obj.richText.map((r) => r.text).join("");
+    if (obj.result !== undefined && obj.result !== null) return String(obj.result);
+    return "";
+  }
+  return String(value);
+}
+
+// Reads the first worksheet's first row as headers and every row after as a record keyed by
+// those headers — the same {csv column name: string value} shape csv-parse produces, so
+// everything downstream (mapping, validation, entity resolution, quarantine, resume) never has
+// to know which file format a run started from.
+async function parseXlsx(buffer: Buffer): Promise<Record<string, string>[]> {
+  const workbook = new ExcelJS.Workbook();
+  // exceljs's bundled .d.ts declares its own ambient `Buffer extends ArrayBuffer`, which
+  // collides with @types/node's real (generic) Buffer in the global scope — `Buffer` in
+  // .load()'s own signature now names that broken merged type, so even a genuine Node Buffer
+  // fails this call's type check even though it's exactly what .load() expects and handles at
+  // runtime. `Buffer` itself can't be used to cast past this; only `any` escapes it.
+  await workbook.xlsx.load(buffer as any);
+  const worksheet = workbook.worksheets[0];
+  if (!worksheet) return [];
+
+  const headers: string[] = [];
+  worksheet.getRow(1).eachCell({ includeEmpty: true }, (cell, colNumber) => {
+    headers[colNumber] = xlsxCellToString(cell.value).trim();
+  });
+
+  const records: Record<string, string>[] = [];
+  worksheet.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    const record: Record<string, string> = {};
+    let hasValue = false;
+    row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+      const header = headers[colNumber];
+      if (!header) return;
+      const value = xlsxCellToString(cell.value);
+      if (value !== "") hasValue = true;
+      record[header] = value;
+    });
+    if (hasValue) records.push(record);
+  });
+  return records;
+}
+
+// Single entry point for turning an uploaded file into rows, dispatching on filename extension
+// (blueprint scope: CSV or XLSX, disclosed as a cut corner in the PRD until now — no live
+// connectors either way, still a file upload).
+async function parseIngestionFile(buffer: Buffer, filename: string): Promise<Record<string, string>[]> {
+  if (XLSX_FILENAME.test(filename)) return parseXlsx(buffer);
+  return parse(buffer, { columns: true, skip_empty_lines: true, trim: true });
+}
 
 // Fuzzy-match thresholds for entity resolution against existing objects of the same type.
 // Above AUTO_MERGE: confident enough to merge automatically (reversible via canonical_of).
@@ -574,7 +646,7 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const filePart = await request.file();
-    if (!filePart) return reply.code(400).send({ error: "a CSV file is required" });
+    if (!filePart) return reply.code(400).send({ error: "a CSV or XLSX file is required" });
     const sourceId = (filePart.fields.sourceId as { value?: string } | undefined)?.value;
     const templateId = (filePart.fields.templateId as { value?: string } | undefined)?.value;
     const edgeTemplateId = (filePart.fields.edgeTemplateId as { value?: string } | undefined)?.value;
@@ -583,14 +655,14 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
     }
 
     const buffer = await filePart.toBuffer();
+    const filename = filePart.filename ?? "upload";
     let records: Record<string, string>[];
     try {
-      records = parse(buffer, { columns: true, skip_empty_lines: true, trim: true });
+      records = await parseIngestionFile(buffer, filename);
     } catch (err) {
-      return reply.code(400).send({ error: `could not parse CSV: ${err instanceof Error ? err.message : String(err)}` });
+      return reply.code(400).send({ error: `could not parse the uploaded file: ${err instanceof Error ? err.message : String(err)}` });
     }
     const fileHash = createHash("sha256").update(buffer).digest("hex");
-    const filename = filePart.filename ?? "upload.csv";
 
     if (edgeTemplateId) {
       const setup = await withRequestContext(ctx, async (client) => {
@@ -676,13 +748,13 @@ const ingestionRoutes: FastifyPluginAsync = async (app) => {
     const { id: runId } = request.params as { id: string };
 
     const filePart = await request.file();
-    if (!filePart) return reply.code(400).send({ error: "the original CSV file must be re-uploaded to resume" });
+    if (!filePart) return reply.code(400).send({ error: "the original file must be re-uploaded to resume" });
     const buffer = await filePart.toBuffer();
     let records: Record<string, string>[];
     try {
-      records = parse(buffer, { columns: true, skip_empty_lines: true, trim: true });
+      records = await parseIngestionFile(buffer, filePart.filename ?? "upload");
     } catch (err) {
-      return reply.code(400).send({ error: `could not parse CSV: ${err instanceof Error ? err.message : String(err)}` });
+      return reply.code(400).send({ error: `could not parse the uploaded file: ${err instanceof Error ? err.message : String(err)}` });
     }
     const fileHash = createHash("sha256").update(buffer).digest("hex");
 

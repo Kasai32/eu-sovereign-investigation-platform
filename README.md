@@ -327,6 +327,12 @@ short version:
   continues in the background, and the intake UI polls for status. Verified against a real
   20k-row run: the request returned in ~70ms, and concurrent requests stayed fast (2-20ms)
   throughout processing instead of contending for a starved pool.
+- **XLSX ingestion**: the blueprint's disclosed CSV/XLSX scope cut is closed — a shared
+  `parseIngestionFile()` entry point turns either format into the same row shape, so mapping,
+  validation, entity resolution, quarantine, and resume never branch on file format. Verified
+  against a real `.xlsx` file, including crashing a 3,000-row run mid-flight and resuming it
+  with zero duplicates, same as CSV. Uses `exceljs`, not the npm-published `xlsx` package —
+  the latter carries two unfixed advisories with no fix in the npm ecosystem at all.
 
 An "AI Project Improvements & Persistent Memory System" proposal (multi-agent decision
 personas, a knowledge-graph world model, confidence/scenario engines, an autonomous
@@ -356,5 +362,5 @@ What's left before a design-partner pilot: retention enforcement, DPIA/records-o
 tooling, and a backend-for-frontend to move browser tokens out of `sessionStorage` into an
 httpOnly cookie (`DECISIONS.md` #11) — plus an actual cloud deployment to an EU host, none of
 which exist yet because there's no shared environment to deploy to. `docs/PLAN.md` phases the
-remaining PRD v1.1 items (retention enforcement, XLSX ingestion, API type safety, deployment,
-backup/restore); the BFF/token item isn't yet in that plan.
+remaining PRD v1.1 items (retention enforcement, API type safety, deployment, backup/restore —
+XLSX ingestion is done); the BFF/token item isn't yet in that plan.
