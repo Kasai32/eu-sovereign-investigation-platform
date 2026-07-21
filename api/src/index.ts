@@ -6,7 +6,7 @@ import multipart from "@fastify/multipart";
 import { authenticate } from "./auth.js";
 import objectsRoutes from "./routes/objects.js";
 import graphRoutes from "./routes/graph.js";
-import casesRoutes from "./routes/cases.js";
+import casesRoutes from "./routes/cases/index.js";
 import auditRoutes from "./routes/audit.js";
 import objectTypesRoutes from "./routes/objectTypes.js";
 import ingestionRoutes from "./routes/ingestion.js";
