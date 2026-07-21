@@ -15,6 +15,9 @@ import { ClassificationBadge } from "./components/ClassificationBadge";
 import { CaseWorkspacePage } from "./CaseWorkspacePage";
 import { IntakePage } from "./IntakePage";
 import { ResolutionQueuePage } from "./ResolutionQueuePage";
+import { AdminUsersPage } from "./AdminUsersPage";
+import { AuditLogPage } from "./AuditLogPage";
+import { CaseReportPage } from "./CaseReportPage";
 
 // ---------------------------------------------------------------------------
 // Root layout: shows a sign-in screen when unauthenticated, nav + Outlet otherwise. The
@@ -45,7 +48,7 @@ function RootLayout() {
 
   return (
     <div className="min-h-screen bg-slate-50">
-      <nav className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3">
+      <nav className="flex items-center justify-between border-b border-slate-200 bg-white px-6 py-3 print:hidden">
         <div className="flex items-center gap-6">
           <span className="font-semibold text-slate-900">Investigation Platform</span>
           <Link to="/search" className="text-sm text-slate-600 hover:text-slate-900 [&.active]:font-semibold [&.active]:text-slate-900">
@@ -63,6 +66,16 @@ function RootLayout() {
           >
             Resolution queue
           </Link>
+          {auth.roles.some((r) => ["compliance", "admin"].includes(r)) && (
+            <Link to="/audit" className="text-sm text-slate-600 hover:text-slate-900 [&.active]:font-semibold [&.active]:text-slate-900">
+              Audit
+            </Link>
+          )}
+          {auth.roles.includes("admin") && (
+            <Link to="/admin/users" className="text-sm text-slate-600 hover:text-slate-900 [&.active]:font-semibold [&.active]:text-slate-900">
+              Users
+            </Link>
+          )}
         </div>
         <div className="flex items-center gap-3 text-sm text-slate-600">
           <span>
@@ -73,7 +86,7 @@ function RootLayout() {
           </button>
         </div>
       </nav>
-      <main className="p-6">
+      <main className="p-6 print:p-0">
         <Outlet />
       </main>
     </div>
@@ -452,6 +465,13 @@ const resolutionQueueRoute = createRoute({
   path: "/resolution-queue",
   component: ResolutionQueuePage,
 });
+const adminUsersRoute = createRoute({ getParentRoute: () => rootRoute, path: "/admin/users", component: AdminUsersPage });
+const auditLogRoute = createRoute({ getParentRoute: () => rootRoute, path: "/audit", component: AuditLogPage });
+const caseReportRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/cases/$id/report",
+  component: CaseReportPage,
+});
 
 const routeTree = rootRoute.addChildren([
   indexRoute,
@@ -460,8 +480,11 @@ const routeTree = rootRoute.addChildren([
   objectDetailRoute,
   casesRoute,
   caseWorkspaceRoute,
+  caseReportRoute,
   intakeRoute,
   resolutionQueueRoute,
+  adminUsersRoute,
+  auditLogRoute,
 ]);
 
 export const router = createRouter({ routeTree });

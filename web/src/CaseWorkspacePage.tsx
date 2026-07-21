@@ -175,6 +175,13 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
         <h1 className="text-xl font-semibold text-slate-900">{theCase.title}</h1>
         <ClassificationBadge classification={theCase.classification} />
         <span className="text-sm text-slate-500">{theCase.status}</span>
+        {/* Plain anchor, not TanStack Router's <Link>: keeps CaseWorkspace renderable in
+            isolation (no router context) for CaseWorkspacePage.test.tsx, at the cost of a full
+            page navigation for this one export link — an acceptable tradeoff for a non-hot-path
+            action. */}
+        <a href={`/cases/${caseId}/report`} className="ml-auto text-sm text-slate-600 underline hover:text-slate-900">
+          Export report
+        </a>
       </div>
 
       {nodes.size > WARN_NODE_COUNT && (

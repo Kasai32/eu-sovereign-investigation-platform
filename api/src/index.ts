@@ -9,6 +9,7 @@ import auditRoutes from "./routes/audit.js";
 import objectTypesRoutes from "./routes/objectTypes.js";
 import ingestionRoutes from "./routes/ingestion.js";
 import resolutionQueueRoutes from "./routes/resolutionQueue.js";
+import adminRoutes from "./routes/admin.js";
 
 const app = Fastify({ logger: true });
 
@@ -34,6 +35,7 @@ app.register(async (secured) => {
   await secured.register(objectTypesRoutes);
   await secured.register(ingestionRoutes);
   await secured.register(resolutionQueueRoutes);
+  await secured.register(adminRoutes);
 });
 
 const port = Number(process.env.PORT ?? 3001);

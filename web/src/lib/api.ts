@@ -153,6 +153,41 @@ export type ResolutionQueueItem = {
   neighborsB: { relationship: string; neighbor_id: string; neighbor_type: string }[];
 };
 
+export type AppUser = {
+  id: string;
+  email: string;
+  display_name: string;
+  role: "analyst" | "supervisor" | "compliance" | "admin";
+  clearance: "PUBLIC" | "INTERNAL" | "SENSITIVE" | "RESTRICTED";
+  is_active: boolean;
+  created_at: string;
+};
+
+export type AuditEntry = {
+  seq: string;
+  user_id: string;
+  user_name: string | null;
+  action: string;
+  resource_type: string | null;
+  resource_id: string | null;
+  purpose: string;
+  details: Record<string, unknown>;
+  occurred_at: string;
+};
+
+export type AuditChain = { is_valid: boolean; first_broken_seq: string | null };
+
+export type CaseReport = {
+  case: CaseSummary & { evidence_snapshot: unknown; closed_at: string | null };
+  isFrozen: boolean;
+  frozenAt: string | null;
+  entities: { object_id: string; object_type: string; properties: Record<string, unknown>; classification: string; propertyMeta: PropertyMeta[] }[];
+  notes: { body: string; author_name: string; created_at: string }[];
+  activity: { action: string; details: Record<string, unknown>; actor_name: string; occurred_at: string }[];
+  viewerClearance: string;
+  generatedAt: string;
+};
+
 async function request<T>(path: string, token: string, init?: RequestInit): Promise<T> {
   // FormData bodies (CSV upload) must NOT get an explicit Content-Type — the browser sets the
   // multipart boundary itself. JSON bodies do.
@@ -312,6 +347,23 @@ export function useApiClient() {
         withToken((token) =>
           request<{ ok: true }>(`/resolution-queue/${id}/undo`, token, { method: "POST", body: JSON.stringify({ purpose }) }),
         ),
+
+      listAdminUsers: () => withToken((token) => request<{ users: AppUser[] }>("/admin/users", token)),
+
+      updateAdminUser: (id: string, body: { role?: string; clearance?: string; isActive?: boolean; purpose?: string }) =>
+        withToken((token) =>
+          request<{ user: AppUser }>(`/admin/users/${id}`, token, { method: "PATCH", body: JSON.stringify(body) }),
+        ),
+
+      getAudit: (params: { userId?: string; action?: string; resourceType?: string; from?: string; to?: string; purpose: string }) =>
+        withToken((token) => {
+          const search = new URLSearchParams();
+          for (const [k, v] of Object.entries(params)) if (v) search.set(k, v);
+          return request<{ entries: AuditEntry[]; chain: AuditChain }>(`/audit?${search.toString()}`, token);
+        }),
+
+      getCaseReport: (caseId: string, purpose: string) =>
+        withToken((token) => request<CaseReport>(`/cases/${caseId}/report?purpose=${encodeURIComponent(purpose)}`, token)),
     };
   }, [getValidAccessToken]);
 }

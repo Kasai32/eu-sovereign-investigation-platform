@@ -13,7 +13,15 @@ const auditRoutes: FastifyPluginAsync = async (app) => {
     if (!AUDIT_ROLES.includes(request.ctx.actorRole)) {
       return reply.code(403).send({ error: "audit log access is restricted to compliance/admin roles" });
     }
-    const q = request.query as { userId?: string; action?: string; limit?: string; purpose?: string };
+    const q = request.query as {
+      userId?: string;
+      action?: string;
+      resourceType?: string;
+      from?: string;
+      to?: string;
+      limit?: string;
+      purpose?: string;
+    };
     if (!q.purpose) return reply.code(400).send({ error: "purpose query param is required to view the audit log" });
 
     const result = await withRequestContext(request.ctx, async (client) => {
@@ -21,17 +29,31 @@ const auditRoutes: FastifyPluginAsync = async (app) => {
       const params: unknown[] = [];
       if (q.userId) {
         params.push(q.userId);
-        conditions.push(`user_id = $${params.length}`);
+        conditions.push(`a.user_id = $${params.length}`);
       }
       if (q.action) {
         params.push(q.action);
-        conditions.push(`action = $${params.length}`);
+        conditions.push(`a.action = $${params.length}`);
+      }
+      if (q.resourceType) {
+        params.push(q.resourceType);
+        conditions.push(`a.resource_type = $${params.length}`);
+      }
+      if (q.from) {
+        params.push(q.from);
+        conditions.push(`a.occurred_at >= $${params.length}`);
+      }
+      if (q.to) {
+        params.push(q.to);
+        conditions.push(`a.occurred_at <= $${params.length}`);
       }
       const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
       params.push(Math.min(Number(q.limit ?? 100), 500));
       const { rows: entries } = await client.query(
-        `SELECT seq, user_id, action, resource_type, resource_id, purpose, details, occurred_at
-         FROM audit_log ${where} ORDER BY seq DESC LIMIT $${params.length}`,
+        `SELECT a.seq, a.user_id, u.display_name AS user_name, a.action, a.resource_type, a.resource_id,
+                a.purpose, a.details, a.occurred_at
+         FROM audit_log a LEFT JOIN app_users u ON u.id = a.user_id
+         ${where} ORDER BY a.seq DESC LIMIT $${params.length}`,
         params,
       );
       const { rows: chainCheck } = await client.query(`SELECT * FROM verify_audit_log()`);
@@ -41,7 +63,7 @@ const auditRoutes: FastifyPluginAsync = async (app) => {
         userId: request.ctx!.userId,
         action: "audit.read",
         purpose: q.purpose!,
-        details: { userIdFilter: q.userId, actionFilter: q.action },
+        details: { userIdFilter: q.userId, actionFilter: q.action, resourceTypeFilter: q.resourceType, from: q.from, to: q.to },
       });
 
       return { entries, chain: chainCheck[0] };

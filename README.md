@@ -191,11 +191,50 @@ web/src/
 Same as before. Sign in as `adam.admin` to create sources/templates, or `sam.supervisor` to
 upload against ones that already exist. Any seed user can review the resolution queue.
 
+## Phase 5: S7 — admin, audit, and case export
+
+User administration (`/admin/users`, admin only), the audit log viewer (`/audit`,
+compliance/admin only, with a live chain-verification badge and filters), and case export — the
+blueprint's "headline feature" — as a printable HTML report (browser print-to-PDF) plus a
+Markdown download, reachable from a case workspace's "Export report" link. Verified live,
+including changing a real user's clearance via the UI and confirming it took effect on their
+very next request without re-login.
+
+This phase also upgraded `evidence_snapshot` (frozen on case close since Phase 1, never actually
+read until now) to embed full object/edge property values, not just IDs — verified by editing a
+frozen entity's live property and confirming the closed case's report still showed the old
+value. Redaction on export is automatic: for open cases it's inherited from the same RLS-scoped
+connection as everything else; for closed cases (reading frozen JSON rather than live rows) it's
+applied explicitly against the viewer's clearance, since RLS filters rows, not values inside a
+jsonb column — see `PHASE5_REVIEW.md` for why that distinction matters.
+
+Also fixed a real bug found while testing: the audit log's filter inputs lost keystrokes after
+the first character (an `isLoading` early-return was unmounting the inputs on every filter
+keystroke). Every other screen with a loading gate was checked for the same pattern; none of the
+others share it, since they only gate loading after a one-time submission, not live typing.
+
+```
+api/src/routes/
+  admin.ts       GET/PATCH /admin/users, admin-only, audited
+  audit.ts       + date-range/resource-type filters, user display names
+  cases.ts       + GET /cases/:id/report (evidence-snapshot-aware), status-close snapshot now
+                 embeds full object/edge data, not just IDs
+web/src/
+  AdminUsersPage.tsx   S7 user administration
+  AuditLogPage.tsx     S7 audit log viewer
+  CaseReportPage.tsx   S7 case export (print-to-PDF + Markdown)
+```
+
+### Running Phase 5
+
+Same as before. Sign in as `adam.admin` for the Users and Audit screens (nav links only appear
+for compliance/admin roles). Export a report from any case workspace's "Export report" link.
+
 ## Status
 
-Phase 0 (schema + RLS + audit chain + synthetic seed), Phase 1 (API + real Keycloak auth),
-Phase 2 (S1/S3/S4 frontend), Phase 3 (S2 case workspace), and Phase 4 (S5 intake + S6 entity
-resolution) are done and verified — see `PHASE0_REVIEW.md` through `PHASE4_REVIEW.md`. Next:
-S7's admin/audit UI (the `/audit` API route exists, unused by any screen yet) and hardening
-(ISO 27001 gap assessment, real secrets management) before the first design-partner pilot, per
-the strategy document's phasing.
+Phases 0–5 (schema/RLS/audit chain, API + Keycloak auth, S1/S3/S4 frontend, S2 case workspace,
+S5/S6 intake + entity resolution, S7 admin/audit/export) are done and verified — see
+`PHASE0_REVIEW.md` through `PHASE5_REVIEW.md`. This closes out the blueprint's originally-scoped
+v1 screen list. What's next is hardening (ISO 27001 gap assessment, real secrets management,
+rate limiting, per-environment CORS config) before a design-partner pilot, per the strategy
+document's own phasing — not new product surface.
