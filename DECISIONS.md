@@ -623,3 +623,49 @@ same failure mode. Resumability was verified the same way #38 verified it for CS
 3,000-row `.xlsx`, killed the server at 1,500 rows durably committed, restarted, resumed with the
 same file via `/resume`, and confirmed exactly 3,000 total objects with zero duplicates.
 **Source:** `api/src/routes/ingestion.ts`, `api/package.json`, `web/src/IntakePage.tsx`
+
+### #48 — Retention enforcement anonymizes via UPDATE, never deletes (PRD v1.1 N4)
+
+**Choice:** A scheduled sweep (`api/src/retention.ts`, in-process `setInterval`, no new
+infrastructure) finds objects/edges whose sole contributing source has a `retention_days`
+policy and whose last-ingested timestamp is older than that window, then clears
+`properties` to `{"_retention_anonymized_at": "<timestamp>"}` via `UPDATE` — the row, its id,
+its edges, and any case linkage all stay intact. Runs as a dedicated system `app_users` row
+(`00000000-0000-0000-0000-000000000001`, migration 014) at `RESTRICTED` clearance, batched
+500 rows/transaction like ingestion's chunking (#37). An object/edge still pinned to a
+currently-open (`open`/`under_review`) case is skipped regardless of how expired it is — an
+active investigation's legitimate purpose overrides the data-minimization deadline. An admin
+can also trigger a sweep on demand (`POST /admin/retention/run`, purpose-of-use required same
+as the role/clearance route) and see run history (`GET /admin/retention/runs`).
+
+**Reason:** `retention_days` has been stored per source since 009 but never applied — N4 in
+the PRD, and the gap README's "Beyond Phase 6" section named as worse than not claiming a
+retention policy at all.
+
+**Rejected: hard delete.** 005 deliberately grants `app_user` no `DELETE` on
+`objects`/`edges`/`object_property_meta` at all — "read/write, never delete (merges use
+`canonical_of`; cases close, they don't disappear)." Adding a `DELETE` grant + RLS policy to
+make retention work would have silently reversed that Phase 0 decision. Anonymizing via
+`UPDATE` needed zero new grants on any of those three tables. `object_property_meta` itself is
+left untouched — which property keys existed, sourced from where, until when, is provenance
+metadata worth keeping even after the values themselves are gone; only the values move.
+
+**Bug caught during verification, not by inspection:** the sweep's final step (mark the run
+row complete, write the audit entry) ran the audit write under the *triggering* actor's
+identity while the surrounding transaction's session was the system actor — `write_audit_log`'s
+own actor-match guard (added for exactly this kind of mismatch) correctly rejected it. Fixed by
+always attributing the audit entry to the system actor and recording who actually asked for an
+out-of-schedule run in `details.triggeredBy` instead. Caught because the anonymizing `UPDATE`s
+run in their own earlier, already-committed transactions — the audit-write failure rolled back
+only the run-completion bookkeeping, not the underlying data change, which is what surfaced the
+bug on the very first real test rather than in code review.
+
+**Verified** against real data, not just the query in isolation: an object whose source's
+30-day window had elapsed anonymized correctly; a same-source object 5 days old did not; an
+object with no retention-policy source stayed untouched regardless of age; an equally-expired
+object pinned to an `open` case was correctly skipped. Restarted the server with a fresh
+expired object in place and confirmed the scheduled sweep anonymized it automatically within
+seconds of boot, with no manual trigger involved — the actual acceptance bar, not just the
+admin-triggered path. Audit hash-chain still valid after all of the above.
+**Source:** `db/migrations/014_retention_enforcement.sql`, `api/src/retention.ts`,
+`api/src/routes/admin.ts`, `web/src/IntakePage.tsx`

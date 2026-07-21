@@ -2,6 +2,7 @@ import type { FastifyPluginAsync } from "fastify";
 import { withRequestContext } from "../db.js";
 import { writeAudit } from "../audit.js";
 import { ClauseBuilder } from "../lib/clauseBuilder.js";
+import { runRetentionSweep } from "../retention.js";
 
 const ROLES = ["analyst", "supervisor", "compliance", "admin"];
 const CLEARANCES = ["PUBLIC", "INTERNAL", "SENSITIVE", "RESTRICTED"];
@@ -76,6 +77,35 @@ const adminRoutes: FastifyPluginAsync = async (app) => {
     if (result === null) return reply.code(404).send({ error: "not found" });
     if ("error" in result) return reply.code(400).send({ error: result.error });
     reply.send(result.user);
+  });
+
+  // N4: retention enforcement runs on its own schedule (api/src/retention.ts), but an admin
+  // needs to see it happened and be able to trigger it on demand rather than wait a day —
+  // same purpose-of-use requirement as the role/clearance route above, since this makes a
+  // real (if reversible-in-name-only, since it's anonymization not deletion) data change.
+  app.post("/admin/retention/run", async (request, reply) => {
+    if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
+    if (request.ctx.actorRole !== "admin") return reply.code(403).send({ error: "admin only" });
+    const body = request.body as { purpose?: string };
+    if (!body.purpose) return reply.code(400).send({ error: "purpose is required to manually trigger retention enforcement" });
+
+    const result = await runRetentionSweep(request.ctx.userId, body.purpose);
+    reply.send(result);
+  });
+
+  app.get("/admin/retention/runs", async (request, reply) => {
+    if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
+    if (!["supervisor", "compliance", "admin"].includes(request.ctx.actorRole)) {
+      return reply.code(403).send({ error: "supervisor, compliance, or admin only" });
+    }
+    const runs = await withRequestContext(request.ctx, async (client) => {
+      const { rows } = await client.query(
+        `SELECT id, started_at, completed_at, objects_anonymized, edges_anonymized
+         FROM retention_enforcement_runs ORDER BY started_at DESC LIMIT 20`,
+      );
+      return rows;
+    });
+    reply.send({ runs });
   });
 };
 

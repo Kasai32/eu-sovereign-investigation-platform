@@ -333,6 +333,12 @@ short version:
   against a real `.xlsx` file, including crashing a 3,000-row run mid-flight and resuming it
   with zero duplicates, same as CSV. Uses `exceljs`, not the npm-published `xlsx` package —
   the latter carries two unfixed advisories with no fix in the npm ecosystem at all.
+- **Retention enforcement**: `retention_days` was stored per source since Phase 5 but never
+  applied. A scheduled sweep now anonymizes (never deletes — `app_user` has no `DELETE` grant
+  on ontology tables at all, by original design) objects/edges whose source's window has
+  elapsed, skipping anything still pinned to an open case. Verified live: restarted the server
+  with a fresh expired object in place and confirmed the scheduled sweep anonymized it
+  automatically within seconds, no manual trigger involved.
 
 An "AI Project Improvements & Persistent Memory System" proposal (multi-agent decision
 personas, a knowledge-graph world model, confidence/scenario engines, an autonomous
@@ -358,9 +364,9 @@ resumability; the original recursive-CTE shortest path, later replaced by an app
 Check it before re-litigating something already decided or reversing a decision without knowing
 why it was made.
 
-What's left before a design-partner pilot: retention enforcement, DPIA/records-of-processing
-tooling, and a backend-for-frontend to move browser tokens out of `sessionStorage` into an
-httpOnly cookie (`DECISIONS.md` #11) — plus an actual cloud deployment to an EU host, none of
-which exist yet because there's no shared environment to deploy to. `docs/PLAN.md` phases the
-remaining PRD v1.1 items (retention enforcement, API type safety, deployment, backup/restore —
-XLSX ingestion is done); the BFF/token item isn't yet in that plan.
+What's left before a design-partner pilot: DPIA/records-of-processing tooling, and a
+backend-for-frontend to move browser tokens out of `sessionStorage` into an httpOnly cookie
+(`DECISIONS.md` #11) — plus an actual cloud deployment to an EU host, none of which exist yet
+because there's no shared environment to deploy to. `docs/PLAN.md` phases the remaining PRD
+v1.1 items (API type safety, deployment, backup/restore — async ingestion, XLSX ingestion, and
+retention enforcement are done); the BFF/token item isn't yet in that plan.
