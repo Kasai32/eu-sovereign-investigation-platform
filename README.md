@@ -1,5 +1,7 @@
 # EU-Sovereign Investigation Platform
 
+[![GitHub repo](https://img.shields.io/badge/GitHub-Kasai32%2Feu--sovereign--investigation--platform-blue?logo=github)](https://github.com/Kasai32/eu-sovereign-investigation-platform)
+
 AML/financial-crime investigation platform (alert-to-case workflow) for EU-regulated
 compliance/fraud teams. See the three planning documents this repo implements against: the
 build prompt (architecture/security requirements), the market strategy, and the execution
