@@ -1,4 +1,5 @@
 import Fastify from "fastify";
+import cors from "@fastify/cors";
 import { authenticate } from "./auth.js";
 import objectsRoutes from "./routes/objects.js";
 import graphRoutes from "./routes/graph.js";
@@ -6,6 +7,13 @@ import casesRoutes from "./routes/cases.js";
 import auditRoutes from "./routes/audit.js";
 
 const app = Fastify({ logger: true });
+
+// Local dev origin only. A real deployment would read this from config per environment rather
+// than hardcoding it, and would never use a wildcard given the classified data behind this API.
+await app.register(cors, {
+  origin: [process.env.WEB_ORIGIN ?? "http://localhost:3000"],
+  credentials: true,
+});
 
 app.get("/health", async () => ({ ok: true }));
 

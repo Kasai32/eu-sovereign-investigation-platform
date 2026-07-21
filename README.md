@@ -99,8 +99,41 @@ PORT=4000 npm run dev         # 3001 may already be taken by something else on y
 Every route requires a `purpose` param on sensitive access (entity detail, case detail, case
 writes, audit log) — see `PHASE1_REVIEW.md` for where it's required vs. defaulted, and why.
 
+## Phase 2: frontend (S3 search, S4 entity detail, S1 case queue)
+
+React + Vite + TanStack Router/Query + Tailwind in `web/`. Real browser login uses
+Authorization Code + PKCE against Keycloak — not the password-grant shortcut the backend test
+scripts use. Verified in an actual browser (not just typecheck) as two different real users;
+see `PHASE2_REVIEW.md`.
+
+```
+web/
+  src/
+    lib/
+      pkce.ts           code_verifier/code_challenge generation (Web Crypto, no dependency)
+      auth.ts            PKCE login/callback/refresh/logout against Keycloak
+      AuthContext.tsx     React context: tokens, silent refresh, decoded display claims
+      api.ts              typed fetch client (objects/cases), auto-attaches a valid access token
+    router.tsx           root layout + all routes/screens (Search, Object detail, Cases)
+```
+
+### Running Phase 2
+
+```bash
+docker compose up -d          # postgres + keycloak
+./db/scripts/migrate.sh
+./db/scripts/seed.sh
+cd api && npm install && PORT=4000 npm run dev
+cd ../web && npm install && npm run dev   # http://localhost:3000
+```
+
+Sign in as any seed user (e.g. `sam.supervisor` / `devpassword123`) at the Keycloak login page
+you're redirected to. Entity detail requires typing a reason for viewing first — that's not
+decorative, the API 400s without it and the audit log records exactly what you typed.
+
 ## Status
 
-Phase 0 (schema + RLS + audit chain + synthetic seed) and Phase 1 (API layer + real Keycloak
-auth) are done and verified — see `PHASE0_REVIEW.md` and `PHASE1_REVIEW.md`. Next: Phase 2 — the
-actual UI screens (S1 case queue, S2 case workspace with the graph canvas, S3/S4 search).
+Phase 0 (schema + RLS + audit chain + synthetic seed), Phase 1 (API layer + real Keycloak auth),
+and Phase 2 (S1/S3/S4 frontend) are done and verified — see `PHASE0_REVIEW.md`,
+`PHASE1_REVIEW.md`, `PHASE2_REVIEW.md`. Next: Phase 3 — S2 case workspace (graph canvas via
+Cytoscape.js, case file, linked selection).
