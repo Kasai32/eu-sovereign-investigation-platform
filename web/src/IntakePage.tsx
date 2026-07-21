@@ -18,6 +18,16 @@ export function IntakePage() {
   const objectTypesQuery = useQuery({ queryKey: ["object-types"], queryFn: () => api.listObjectTypes() });
   const relationshipTypesQuery = useQuery({ queryKey: ["relationship-types"], queryFn: () => api.listRelationshipTypes() });
   const runsQuery = useQuery({ queryKey: ["ingestion-runs"], queryFn: () => api.listIngestionRuns() });
+  const retentionRunsQuery = useQuery({ queryKey: ["retention-runs"], queryFn: () => api.listRetentionRuns(), enabled: isAdmin });
+
+  const [retentionPurpose, setRetentionPurpose] = useState("");
+  const runRetention = useMutation({
+    mutationFn: () => api.runRetentionEnforcement(retentionPurpose),
+    onSuccess: () => {
+      setRetentionPurpose("");
+      queryClient.invalidateQueries({ queryKey: ["retention-runs"] });
+    },
+  });
 
   const [newSourceName, setNewSourceName] = useState("");
   const createSource = useMutation({
@@ -308,7 +318,11 @@ export function IntakePage() {
             <li key={s.id} className="flex items-center gap-2">
               <span>{s.name}</span>
               <ClassificationBadge classification={s.default_classification} />
-              {s.retention_days && <span className="text-xs text-slate-400">retain {s.retention_days}d</span>}
+              {s.retention_days ? (
+                <span className="text-xs text-slate-400">retain {s.retention_days}d, enforced</span>
+              ) : (
+                <span className="text-xs text-slate-300">no retention policy</span>
+              )}
             </li>
           ))}
         </ul>
@@ -332,6 +346,54 @@ export function IntakePage() {
           </form>
         )}
       </section>
+
+      {/* Retention enforcement (N4): sources with a retention_days policy above have it applied
+          on a schedule, not just stored — this shows that it actually runs, and admins can also
+          trigger a sweep on demand rather than wait for the next scheduled run. */}
+      {isAdmin && (
+        <section className="rounded border border-slate-200 bg-white p-4">
+          <h2 className="mb-3 text-sm font-semibold text-slate-700">Retention enforcement</h2>
+          <ul className="mb-3 space-y-1 text-sm">
+            {retentionRunsQuery.data?.runs.map((r) => (
+              <li key={r.id} className="text-slate-600">
+                {new Date(r.started_at).toLocaleString()} —{" "}
+                {r.completed_at
+                  ? `${r.objects_anonymized} objects, ${r.edges_anonymized} edges anonymized`
+                  : "in progress"}
+              </li>
+            ))}
+            {(retentionRunsQuery.data?.runs.length ?? 0) === 0 && (
+              <li className="text-slate-400">No retention enforcement runs yet.</li>
+            )}
+          </ul>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (retentionPurpose.trim()) runRetention.mutate();
+            }}
+            className="flex gap-2"
+          >
+            <input
+              value={retentionPurpose}
+              onChange={(e) => setRetentionPurpose(e.target.value)}
+              placeholder="Purpose (required to run now)"
+              className="rounded border border-slate-300 px-2 py-1 text-sm"
+            />
+            <button
+              type="submit"
+              disabled={!retentionPurpose.trim() || runRetention.isPending}
+              className="rounded bg-slate-100 px-3 py-1 text-sm hover:bg-slate-200 disabled:opacity-50"
+            >
+              {runRetention.isPending ? "Running…" : "Run now"}
+            </button>
+          </form>
+          {runRetention.isSuccess && (
+            <p className="mt-2 text-sm text-emerald-700">
+              {runRetention.data.objectsAnonymized} objects, {runRetention.data.edgesAnonymized} edges anonymized.
+            </p>
+          )}
+        </section>
+      )}
 
       {/* Templates */}
       <section className="rounded border border-slate-200 bg-white p-4">

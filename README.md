@@ -321,6 +321,12 @@ short version:
 - **Keycloak client split**: the browser client (`platform-api`) no longer allows the
   password-grant flow the backend test scripts used; a separate `platform-test` client handles
   that now. Closes the item `SECURITY_GAP_ASSESSMENT.md` named as top-priority.
+- **Retention enforcement**: `retention_days` was stored per source since Phase 5 but never
+  applied. A scheduled sweep now anonymizes (never deletes — `app_user` has no `DELETE` grant
+  on ontology tables at all, by original design) objects/edges whose source's window has
+  elapsed, skipping anything still pinned to an open case. Verified live: restarted the server
+  with a fresh expired object in place and confirmed the scheduled sweep anonymized it
+  automatically within seconds, no manual trigger involved.
 
 An "AI Project Improvements & Persistent Memory System" proposal (multi-agent decision
 personas, a knowledge-graph world model, confidence/scenario engines, an autonomous
@@ -346,7 +352,9 @@ resumability; the original recursive-CTE shortest path, later replaced by an app
 Check it before re-litigating something already decided or reversing a decision without knowing
 why it was made.
 
-What's left before a design-partner pilot: retention enforcement, DPIA/records-of-processing
-tooling, and a backend-for-frontend to move browser tokens out of `sessionStorage` into an
-httpOnly cookie (`DECISIONS.md` #11) — plus an actual cloud deployment to an EU host, none of
-which exist yet because there's no shared environment to deploy to.
+What's left before a design-partner pilot: DPIA/records-of-processing tooling, and a
+backend-for-frontend to move browser tokens out of `sessionStorage` into an httpOnly cookie
+(`DECISIONS.md` #11) — plus an actual cloud deployment to an EU host, none of which exist yet
+because there's no shared environment to deploy to. `docs/PLAN.md` phases the remaining PRD
+v1.1 items (async ingestion, XLSX ingestion, API type safety, deployment, backup/restore —
+retention enforcement is done); the BFF/token item isn't yet in that plan.
