@@ -1,33 +1,20 @@
 import { z } from "zod";
+import { caseStatusSchema, classificationSchema, isoTimestampSchema, purposeSchema, uuidSchema } from "./common.js";
 
 // Single source of truth for GET /cases/:id's request and response shapes, imported by both
 // api/src/routes/cases/workspace.ts (validates what it actually sends) and
 // web/src/lib/api/cases.ts (validates what it actually received) — see shared/README.md for
 // why this exists and how to add the next route's schema here.
 
-// Postgres's own `uuid` column type accepts any 8-4-4-4-12 hex value; it does not require
-// RFC4122 version/variant nibbles the way Zod's stricter `z.uuid()` does by default. This
-// codebase's seed data uses deliberately simple, human-readable ids (e.g.
-// `11111111-1111-1111-1111-111111111104` for app_users — db/seed/*.sql) that are valid
-// Postgres uuids but fail `z.uuid()`'s stricter check. `z.guid()` matches the column type's
-// actual constraint instead of over-specifying one Postgres itself doesn't enforce.
-const uuidSchema = z.guid();
-
-// `pg` returns `timestamp`/`timestamptz` columns as JS `Date` objects, not strings — Fastify's
-// `reply.send()` only turns them into ISO strings via JSON.stringify on the way out, which is
-// invisible if you validate the raw pre-serialization object (as every route here does, to
-// catch a shape mismatch before anything is sent, not after). Accepting both and normalizing
-// makes the transform explicit instead of an implicit side effect of JSON.stringify.
-const isoTimestampSchema = z
-  .union([z.string(), z.date()])
-  .transform((value) => (value instanceof Date ? value.toISOString() : value));
-
-export const classificationSchema = z.enum(["PUBLIC", "INTERNAL", "SENSITIVE", "RESTRICTED"]);
-export const caseStatusSchema = z.enum(["open", "under_review", "closed", "archived"]);
+// Re-exported under the names they had while they lived in this file, so nothing that already
+// imports them from here had to change when they moved to ./common.ts for a second route's use.
+export { classificationSchema, caseStatusSchema };
 
 export const caseDetailRequestSchema = z.object({
   id: uuidSchema,
-  purpose: z.string().min(1, "purpose is required to open a case"),
+  // Same fix as caseStatus.ts: an omitted `purpose` used to get Zod's generic invalid_type
+  // message here, worse than the pre-schema route's own wording. See purposeSchema's comment.
+  purpose: purposeSchema("purpose is required to open a case"),
 });
 
 // Matches `SELECT * FROM cases WHERE id = $1` exactly (db/migrations/003_cases.sql) — no

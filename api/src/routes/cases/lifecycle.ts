@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
 import { withRequestContext } from "../../db.js";
 import { writeAudit } from "../../audit.js";
-import { STATUSES } from "./shared.js";
+import { caseStatusRequestSchema, caseStatusResponseSchema } from "../../../../shared/schemas/caseStatus.js";
 
 // Case status transitions (with evidence-snapshot freezing on close) and the S7 report export
 // that consumes that snapshot.
@@ -10,12 +10,24 @@ const casesLifecycleRoutes: FastifyPluginAsync = async (app) => {
   // ingestion or merges never silently rewrite a finalized report's basis.
   app.patch("/cases/:id/status", async (request, reply) => {
     if (!request.ctx) return reply.code(401).send({ error: "unauthenticated" });
-    const { id } = request.params as { id: string };
-    const { status, purpose } = request.body as { status?: string; purpose?: string };
-    if (!status || !STATUSES.includes(status as (typeof STATUSES)[number])) {
-      return reply.code(400).send({ error: `status must be one of ${STATUSES.join(", ")}` });
+    const body = (request.body ?? {}) as { status?: string; purpose?: string };
+    const parsedRequest = caseStatusRequestSchema.safeParse({
+      id: (request.params as { id?: string }).id,
+      status: body.status,
+      purpose: body.purpose,
+    });
+    if (!parsedRequest.success) {
+      const issue = parsedRequest.error.issues[0];
+      // Preserve the pre-schema wording for a bad `status`: it enumerates the valid values,
+      // which Zod's default enum message does not, and it's the message the API's own
+      // error-path behavior was last verified against.
+      const message =
+        issue?.path[0] === "status"
+          ? `status must be one of ${caseStatusRequestSchema.shape.status.options.join(", ")}`
+          : (issue?.message ?? "invalid request");
+      return reply.code(400).send({ error: message });
     }
-    if (!purpose) return reply.code(400).send({ error: "purpose is required to change case status" });
+    const { id, status, purpose } = parsedRequest.data;
 
     const result = await withRequestContext(request.ctx, async (client) => {
       const params: unknown[] = [status, id];
@@ -88,7 +100,7 @@ const casesLifecycleRoutes: FastifyPluginAsync = async (app) => {
     });
 
     if (!result) return reply.code(404).send({ error: "not found" });
-    reply.send(result);
+    reply.send(caseStatusResponseSchema.parse(result));
   });
 
   // S7's headline export. For a closed case, renders from the evidence_snapshot frozen on

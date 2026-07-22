@@ -27,8 +27,15 @@ is a normal dependency of both `api` and `web`.
    import, so this is a non-breaking change to every file that consumes it.
 4. Delete the hand-written type(s) this replaces from `types.ts`.
 
+Primitives used by more than one route (`uuidSchema`, `isoTimestampSchema`,
+`classificationSchema`, `caseStatusSchema`, `purposeSchema`) live in `schemas/common.ts` — put
+them there rather than re-declaring them per route, and note that `api/src/routes/cases/
+shared.ts` already *derives* its `STATUSES`/`LOCKED_STATUSES` from that file rather than
+keeping its own copies.
+
 This is deliberately per-route and incremental — there's no requirement (or expectation) to
-migrate every route in one pass. `GET /cases/:id` is the first; `POST /cases/:id/notes`'
+migrate every route in one pass. `GET /cases/:id` is the first, `PATCH /cases/:id/status` the
+second (`schemas/caseStatus.ts`, DECISIONS.md #51); `POST /cases/:id/notes`'
 response shape (declared as `CaseNote` — `{id, body, author_id, author_name, created_at}` — but
 actually returned as just `{id, body, created_at}`, per `api/src/routes/cases/workspace.ts`) is
 a second, already-known real drift worth doing next.

@@ -1,6 +1,8 @@
 import { request, requestWithSchema, type WithToken } from "./client";
 import type { CaseNote, CaseReport, CaseSummary, GraphEdge, GraphNode } from "./types";
 import { caseDetailResponseSchema } from "../../../../shared/schemas/caseDetail";
+import { caseStatusResponseSchema } from "../../../../shared/schemas/caseStatus";
+import type { CaseStatus } from "../../../../shared/schemas/common";
 
 export function createCasesApi(withToken: WithToken) {
   return {
@@ -47,9 +49,15 @@ export function createCasesApi(withToken: WithToken) {
         return request<{ ok: true }>(`/cases/${caseId}/entities/${objectId}${qs}`, token, { method: "DELETE" });
       }),
 
-    setCaseStatus: (caseId: string, status: string, purpose: string) =>
+    // `status` is the shared schema's union, not a bare `string`: this method had no call site
+    // at all until the workspace's close-case control (DECISIONS.md #50 found the gap), so
+    // there was nothing to break by tightening it to the four values the API actually accepts.
+    setCaseStatus: (caseId: string, status: CaseStatus, purpose: string) =>
       withToken((token) =>
-        request(`/cases/${caseId}/status`, token, { method: "PATCH", body: JSON.stringify({ status, purpose }) }),
+        requestWithSchema(`/cases/${caseId}/status`, token, caseStatusResponseSchema, {
+          method: "PATCH",
+          body: JSON.stringify({ status, purpose }),
+        }),
       ),
 
     getCaseReport: (caseId: string, purpose: string) =>
