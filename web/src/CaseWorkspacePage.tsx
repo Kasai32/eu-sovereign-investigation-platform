@@ -4,7 +4,9 @@ import { useParams } from "@tanstack/react-router";
 import { useApiClient, type GraphEdge, type GraphNode } from "./lib/api";
 import { usePurposeGate } from "./lib/usePurposeGate";
 import { ClassificationBadge } from "./components/ClassificationBadge";
+import { CaseStatusControl } from "./components/CaseStatusControl";
 import { GraphCanvas } from "./components/GraphCanvas";
+import { isCaseLocked } from "../../shared/schemas/common";
 
 // Server caps at 500 nodes (see api/src/routes/graph.ts); this is the UI-side warning
 // threshold from the build prompt's rendering budget ("warn past ~2,000 visible elements").
@@ -142,6 +144,12 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
   if (!caseQuery.data) return null;
 
   const { case: theCase, entities, notes, activity } = caseQuery.data;
+  // The API rejects notes/pins/unpins on a closed or archived case with a 409 (DECISIONS.md
+  // #34). Until the close control existed there was no way to reach that state from the UI in
+  // the first place; now that there is, the controls it blocks are disabled from the same
+  // status list the server enforces with, so the freeze reads as a deliberate state rather
+  // than a failed click.
+  const locked = isCaseLocked(theCase.status);
   const pinnedObjectIds = new Set(entities.map((e) => e.object_id));
   const selectedNode = selectedNodeId ? nodes.get(selectedNodeId) : null;
   const selectedEdge = selectedEdgeId ? edges.get(selectedEdgeId) : null;
@@ -151,7 +159,17 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
       <div className="mb-3 flex items-center gap-3">
         <h1 className="text-xl font-semibold text-slate-900">{theCase.title}</h1>
         <ClassificationBadge classification={theCase.classification} />
-        <span className="text-sm text-slate-500">{theCase.status}</span>
+        <span className="text-sm text-slate-500" data-testid="case-status">
+          {theCase.status}
+        </span>
+        <CaseStatusControl
+          caseId={caseId}
+          currentStatus={theCase.status}
+          onChanged={() => {
+            queryClient.invalidateQueries({ queryKey: ["case", caseId] });
+            queryClient.invalidateQueries({ queryKey: ["case-graph", caseId] });
+          }}
+        />
         {/* Plain anchor, not TanStack Router's <Link>: keeps CaseWorkspace renderable in
             isolation (no router context) for CaseWorkspacePage.test.tsx, at the cost of a full
             page navigation for this one export link — an acceptable tradeoff for a non-hot-path
@@ -197,23 +215,29 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
               </li>
             ))}
           </ul>
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              if (noteBody.trim()) addNoteMutation.mutate();
-            }}
-            className="mb-4 flex gap-1"
-          >
-            <input
-              value={noteBody}
-              onChange={(e) => setNoteBody(e.target.value)}
-              placeholder="Add note…"
-              className="flex-1 rounded border border-slate-300 px-2 py-1 text-xs"
-            />
-            <button type="submit" className="rounded bg-slate-900 px-2 py-1 text-xs text-white">
-              Add
-            </button>
-          </form>
+          {locked ? (
+            <p className="mb-4 rounded bg-slate-50 px-2 py-1.5 text-xs text-slate-500" data-testid="case-locked-notice">
+              This case is {theCase.status} — notes and entities are frozen.
+            </p>
+          ) : (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                if (noteBody.trim()) addNoteMutation.mutate();
+              }}
+              className="mb-4 flex gap-1"
+            >
+              <input
+                value={noteBody}
+                onChange={(e) => setNoteBody(e.target.value)}
+                placeholder="Add note…"
+                className="flex-1 rounded border border-slate-300 px-2 py-1 text-xs"
+              />
+              <button type="submit" className="rounded bg-slate-900 px-2 py-1 text-xs text-white">
+                Add
+              </button>
+            </form>
+          )}
 
           <h2 className="mb-2 text-sm font-semibold text-slate-700">Activity</h2>
           <ul className="space-y-1 text-xs text-slate-500">
@@ -306,7 +330,9 @@ export function CaseWorkspace({ caseId }: { caseId: string }) {
                 <button onClick={() => setPathFrom(selectedNode.id)} className="rounded bg-slate-100 px-2 py-1 text-xs hover:bg-slate-200">
                   Find path from here
                 </button>
-                {pinnedObjectIds.has(selectedNode.id) ? (
+                {/* Expand/hide/pin-position/find-path above are read-only graph exploration and
+                    stay available on a frozen case — only the two writes are withheld. */}
+                {locked ? null : pinnedObjectIds.has(selectedNode.id) ? (
                   <button
                     onClick={() => unpinEntityMutation.mutate(selectedNode.id)}
                     className="rounded bg-red-50 px-2 py-1 text-xs text-red-700 hover:bg-red-100"

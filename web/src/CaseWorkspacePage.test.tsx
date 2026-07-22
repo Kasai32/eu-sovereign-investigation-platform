@@ -3,6 +3,7 @@ import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { CaseWorkspace } from "./CaseWorkspacePage";
+import type { CaseStatus } from "../../shared/schemas/common";
 
 // Cross-pane linked selection is the P0 requirement from the build prompt: "selecting an
 // entity in any view highlights it everywhere else... write an integration test for it, don't
@@ -47,7 +48,9 @@ const fixtureCase = {
   case: {
     id: "case-1",
     title: "Test Case",
-    status: "open" as const,
+    // Widened to the shared schema's union (not `as const`) so a test can override it to a
+    // locked status without the fixture's inferred literal type rejecting it.
+    status: "open" as CaseStatus,
     priority: "normal",
     classification: "INTERNAL",
     assigned_to: null,
@@ -89,12 +92,17 @@ const fixtureGraph = {
 };
 
 const mockApi = {
-  getCase: vi.fn(async () => fixtureCase),
+  getCase: vi.fn(async () => fixtureCase as typeof fixtureCase),
   getCaseGraph: vi.fn(async () => fixtureGraph),
   addNote: vi.fn(async () => ({})),
   pinEntity: vi.fn(async () => ({ ok: true as const })),
   unpinEntity: vi.fn(async () => ({ ok: true as const })),
-  setCaseStatus: vi.fn(async () => ({})),
+  setCaseStatus: vi.fn(async () => ({
+    id: "case-1",
+    status: "closed" as const,
+    evidence_snapshot: {},
+    closed_at: "2026-01-02T00:00:00Z",
+  })),
   expandGraph: vi.fn(async () => ({ nodes: [], edges: [], truncated: false, requestedHops: 1 })),
   findPath: vi.fn(async () => ({ found: false as const, nodes: [] as const, edges: [] as const, budgetExceeded: false })),
 };
@@ -113,19 +121,25 @@ function renderWorkspace() {
   );
 }
 
+async function passPurposeGate(user: ReturnType<typeof userEvent.setup>, purpose: string) {
+  const purposeInput = await screen.findByPlaceholderText(/reviewing assigned structuring alert/i);
+  await user.type(purposeInput, purpose);
+  await user.click(screen.getByRole("button", { name: /continue/i }));
+}
+
 describe("case workspace cross-pane linked selection", () => {
   beforeEach(() => {
     selectSpy.mockClear();
     getElementByIdMock.mockClear();
+    mockApi.getCase.mockResolvedValue(fixtureCase);
+    mockApi.setCaseStatus.mockClear();
   });
 
   it("selecting an entity in the case file pane highlights it in the graph and populates the inspector", async () => {
     const user = userEvent.setup();
     renderWorkspace();
 
-    const purposeInput = await screen.findByPlaceholderText(/reviewing assigned structuring alert/i);
-    await user.type(purposeInput, "testing linked selection");
-    await user.click(screen.getByRole("button", { name: /continue/i }));
+    await passPurposeGate(user, "testing linked selection");
 
     const entityButton = await screen.findByTestId("case-entity-obj-1");
 
@@ -146,5 +160,53 @@ describe("case workspace cross-pane linked selection", () => {
     // genuinely reached the third pane via props/effects, not just local component state.
     expect(getElementByIdMock).toHaveBeenCalledWith("obj-1");
     expect(selectSpy).toHaveBeenCalled();
+  });
+});
+
+// The close-case control is what completes the alert→case→document→close cycle inside the
+// product: PATCH /cases/:id/status has existed since Phase 1 but had no caller in the web app,
+// so #50's deployment verification had to close its case with curl.
+describe("case status control", () => {
+  beforeEach(() => {
+    mockApi.getCase.mockResolvedValue(fixtureCase);
+    mockApi.setCaseStatus.mockClear();
+  });
+
+  it("closes a case with an explicit purpose-of-use, separate from the workspace's opening purpose", async () => {
+    const user = userEvent.setup();
+    renderWorkspace();
+    await passPurposeGate(user, "reviewing assigned structuring alert");
+
+    await user.click(await screen.findByTestId("change-status-button"));
+    await user.selectOptions(screen.getByLabelText(/new status/i), "closed");
+
+    const confirm = screen.getByRole("button", { name: /confirm/i });
+    // The API 400s without a purpose; the control shouldn't let the request be made at all.
+    expect(confirm).toBeDisabled();
+
+    await user.type(screen.getByLabelText(/reason for this status change/i), "SAR filed, investigation concluded");
+    expect(confirm).toBeEnabled();
+    await user.click(confirm);
+
+    // The purpose sent is the one typed here, NOT the workspace's "reviewing assigned
+    // structuring alert" — the audit entry for closing has to say why it was closed.
+    expect(mockApi.setCaseStatus).toHaveBeenCalledWith("case-1", "closed", "SAR filed, investigation concluded");
+  });
+
+  it("freezes note and entity controls on a closed case, matching the API's 409", async () => {
+    mockApi.getCase.mockResolvedValue({ ...fixtureCase, case: { ...fixtureCase.case, status: "closed" as const } });
+    const user = userEvent.setup();
+    renderWorkspace();
+    await passPurposeGate(user, "auditing a concluded case");
+
+    expect(await screen.findByTestId("case-locked-notice")).toHaveTextContent(/closed/i);
+    expect(screen.queryByPlaceholderText(/add note/i)).not.toBeInTheDocument();
+
+    // Read-only graph exploration stays available; only the writes the API rejects are gone.
+    await user.click(await screen.findByTestId("case-entity-obj-1"));
+    const inspector = screen.getByTestId("inspector-pane");
+    expect(within(inspector).getByRole("button", { name: /expand/i })).toBeInTheDocument();
+    expect(within(inspector).queryByRole("button", { name: /remove from case/i })).not.toBeInTheDocument();
+    expect(within(inspector).queryByRole("button", { name: /add to case/i })).not.toBeInTheDocument();
   });
 });

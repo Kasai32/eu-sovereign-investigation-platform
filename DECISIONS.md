@@ -792,3 +792,109 @@ containers/network removed, `.env.deploy` and the patched realm export deleted; 
 **Source:** `deploy/run-ephemeral-demo.sh`, `deploy/teardown.sh`, `deploy/README.md`,
 `docker-compose.prod.yml`, `api/Dockerfile`, `web/Dockerfile`, `web/Caddyfile`, `api/package.json`,
 `db/scripts/migrate.sh`, `db/scripts/seed.sh`
+
+---
+
+## This session — close-case UI control
+
+### #51 — Close-case control in the workspace, on a shared schema (backlog item 2 / PRD v1.1 N5 continuation)
+
+**Choice:** `web/src/components/CaseStatusControl.tsx` — a status selector plus its own
+purpose-of-use field, in the case workspace header — is the first and only caller of
+`PATCH /cases/:id/status`. That route, and the evidence-snapshot freeze it performs on close
+(#18), have existed since Phase 1; `setCaseStatus` had existed in `web/src/lib/api/cases.ts`
+since the #39 split. Nothing had ever called it. The route was migrated to a shared Zod schema
+(`shared/schemas/caseStatus.ts`) in the same change, so its contract is checked from its first
+call site rather than added as a hand-asserted `request<T>` now and migrated later.
+
+**Reason:** #50's deployment verification could not finish the alert→case→document→close cycle
+in the product — it had to close its case with `curl` — which makes an unassisted pilot
+walkthrough impossible, since "analyst completes alert→case→document→close without leaving the
+product or asking for help" is a §6 success metric of the PRD verbatim.
+
+**Purpose-of-use is collected again, not inherited.** The workspace's own opening purpose
+("reviewing assigned structuring alert") explains why the case was *read*; it is not why it was
+*closed*. The API requires a purpose with a 400 either way — the decision here is that the
+control asks a second time rather than silently forwarding the first answer, so the audit entry
+for a close says something an auditor can use. Verified in the live audit log:
+`case.status_change | SAR filed, investigation concluded`.
+
+**Schema-extraction note:** `uuidSchema`/`isoTimestampSchema`/`classificationSchema`/
+`caseStatusSchema` moved from `caseDetail.ts` (private) to a new `shared/schemas/common.ts` the
+moment a second route needed them, and are re-exported from `caseDetail.ts` under their old
+names so nothing importing them changed. `api/src/routes/cases/shared.ts`'s `STATUSES` and
+`LOCKED_STATUSES` are now *derived* from that file rather than independently re-declared —
+adding the web app as a third consumer of the same list is exactly how the drift N5 exists to
+close would have started.
+
+**Locked-state UI, deliberately included.** #34 made the API reject notes/pins/unpins on a
+closed or archived case with a 409, but until this control existed there was no way to reach
+that state from the UI at all. Now that closing is one click, the note form is replaced by a
+"notes and entities are frozen" notice and the Add/Remove-from-case buttons are withheld — from
+`LOCKED_CASE_STATUSES`, the same list the server enforces with. Read-only graph exploration
+(expand/hide/pin-position/find-path) deliberately stays available on a frozen case.
+
+**Regression fixed, not shipped:** moving the route behind a schema silently degraded its
+missing-`purpose` error from `"purpose is required to change case status"` to Zod's generic
+`"Invalid input: expected string, received undefined"`. `GET /cases/:id` (migrated in #49)
+already had the same degradation and nobody had noticed. Added `purposeSchema(message)` in
+`common.ts`, which sets the message for both the omitted (`error`) and empty-string (`.min(1)`)
+cases; both routes verified live to reply with their original wording again.
+
+**Verified**, not asserted:
+- Full regression suite green: `test-rls.sh`, `test-audit-chain.sh` (all 5 checks),
+  `test-rls-http.sh` (ALL CHECKS PASSED), `web && npm test` (3 passed — 1 pre-existing plus 2
+  new: one asserting the close sends the separately-typed purpose and that Confirm is disabled
+  without one, one asserting the frozen case withholds exactly the controls the API 409s on),
+  and both typechecks.
+- Live API: closing froze a snapshot with the right object count and set `closed_at`; an
+  `open → under_review` transition left `closed_at` and `evidence_snapshot` null (no spurious
+  freeze); a note POST after close returned 409; a note POST while `under_review` returned 201.
+- **Real browser, full PKCE login as `cara.compliance`** (not just typecheck): opened the seed
+  case, used the control to close it, watched the header flip to `closed` and the Activity list
+  gain `status changed` without a reload, confirmed the note form was replaced by the frozen
+  notice and that a selected pinned node kept Expand/Hide/Pin/Find-path but lost "Remove from
+  case", then opened the case report — which rendered `Basis: frozen evidence snapshot captured
+  when this case closed on 22/07/2026, 17:17:30`, i.e. the snapshot this UI's own close created.
+  Zero console errors or warnings. **This is the full alert→case→document→close cycle executed
+  entirely in the product, which is precisely what #50 could not do.** The seed case was then
+  restored to `open` and the audit chain reverified.
+
+**Not changed, deliberately:** no role restriction was added to who may change status. The API
+has never had one, RLS governs which cases are reachable at all, and "may an analyst close their
+own case, or only a supervisor?" is a product question tied to the PRD's own open question #3
+("Is 'closed' a hard freeze or an administrative state?"), not something to answer silently
+inside a UI task.
+
+**Three real bugs found while verifying this, logged rather than drive-by-fixed:**
+
+1. **`db/scripts/migrate.sh` is not idempotent.** Re-running it against an already-migrated
+   database aborts at `003_cases.sql` with `constraint "fk_resolution_queue_decided_by" for
+   relation "resolution_queue" already exists` (the script runs with `ON_ERROR_STOP=1` and
+   `set -e`). Most objects in the migrations are guarded with `IF NOT EXISTS`; that
+   `ADD CONSTRAINT` is not. CI never hits this because it always builds a fresh database (#43),
+   but `README.md` tells a developer to run `./db/scripts/migrate.sh` as a normal step.
+2. **`db/scripts/test-audit-chain.sh` never undoes its own tamper.** It disables the
+   immutability trigger, rewrites the first row's `purpose` to `TAMPERED PURPOSE` to prove
+   detection works, and stops there. Confirmed by direct measurement:
+   `verify_audit_log()` returned `t` before the run and `f,1` after, and a **second consecutive
+   run fails** at `FAIL: chain reported invalid before any tampering`. So the documented
+   regression suite is not re-runnable against a dev database, and `verify_audit_log()` can't be
+   used as a post-suite health signal locally. (Recovered without a re-seed: the original
+   purpose was inferable from the repeating seed triplet in the audit log, and restoring it
+   returned the chain to valid — which is itself proof the restored value was byte-exact, since
+   the chain hash is the checksum.)
+3. **Reopening a closed case leaves `closed_at` and `evidence_snapshot` stale.** The UPDATE only
+   writes those columns when the new status is `closed`, so a `closed → open` transition leaves
+   the old freeze in place: verified, the restored seed case is `status: open` while still
+   carrying `closed_at: 2026-07-22T15:17:30Z` and a populated snapshot. Harmless for the report
+   today (it only consults the snapshot when status is `closed`, and a re-close overwrites it),
+   but it is a live trap for anything that later reads `closed_at` to mean "this case is
+   closed". This mattered less when reopening required `curl`; this change makes it one click.
+   Fixing it needs the same product answer as the role question above — whether reopening is
+   even legitimate — so it is recorded, not guessed at.
+
+**Source:** `shared/schemas/common.ts`, `shared/schemas/caseStatus.ts`,
+`shared/schemas/caseDetail.ts`, `api/src/routes/cases/lifecycle.ts`,
+`api/src/routes/cases/shared.ts`, `web/src/components/CaseStatusControl.tsx`,
+`web/src/CaseWorkspacePage.tsx`, `web/src/lib/api/cases.ts`, `web/src/CaseWorkspacePage.test.tsx`
